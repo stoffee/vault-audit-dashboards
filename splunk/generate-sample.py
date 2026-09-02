@@ -181,7 +181,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--window-days", type=int, default=WINDOW_DAYS,
                     help="how far back events reach. Splunk DROPS events older than the "
-                         "index frozenTimePeriodInSecs; if the trial index has short "
+                         "index frozenTimePeriodInSecs; if your index has short "
                          "retention, shrink this to fit or the old buckets come back empty.")
     ap.add_argument("--expected", action="store_true",
                     help="print ground-truth R1 buckets without writing the file")

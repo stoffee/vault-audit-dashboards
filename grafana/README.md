@@ -1,9 +1,6 @@
 # Grafana
 
 The same answer without Splunk: identical numbers, identical dataset, no SIEM involved.
-Useful if you don't want another Splunk workload, or if the asset shouldn't depend on one.
-
----
 
 ## Architecture
 
@@ -21,19 +18,17 @@ Vault audit device ──► (Fluent Bit / file tail) ──► vault-secret-agg
                                                      Grafana
 ```
 
-**Why not just query Loki for it.** You cannot ask LogQL for "max timestamp per secret path"
-across hundreds of thousands of paths. Path as a stream label is that many active series, and
-it kills the index. So the fold happens in a process, and only aggregates cross the wire.
-Per-secret detail travels as log **lines** (cheap), never as labels (ruinous).
+**Why not just query Loki.** You cannot ask LogQL for "max timestamp per secret path" across
+hundreds of thousands of paths; path as a stream label is that many active series and it
+kills the index. So the fold happens in a process, and only aggregates cross the wire.
+Per-secret detail travels as log lines, never as labels.
 
-**Why findings are stamped "now".** A finding is an observation made today about history. It
-also means they sail past Loki's `reject_old_samples` window, which would otherwise refuse an
-18-month-old timestamp outright.
+**Why findings are stamped "now".** A finding is an observation made today about history.
+It also keeps them inside Loki's `reject_old_samples` window, which would otherwise reject
+an 18-month-old timestamp outright.
 
-**This changes nothing in your stack.** The aggregator *pushes* (Prometheus Pushgateway +
-Loki push API), so no scrape config, no Loki config, and no existing pipeline is touched.
-
----
+**Nothing in your stack changes.** The aggregator pushes (Prometheus Pushgateway + Loki push
+API), so there is no scrape config to edit and no existing pipeline to touch.
 
 ## Files
 
@@ -42,22 +37,17 @@ Loki push API), so no scrape config, no Loki config, and no existing pipeline is
 | `dashboards/vault-secret-hygiene.json` | 7-panel dashboard. Prometheus for aggregates, Loki for the findings table |
 | `../scripts/vault-secret-aggregator.py` | The fold. stdlib only, no dependencies |
 
-⚠️ **Datasource UIDs are inlined and load-bearing.** The JSON ships with the UIDs from the
-environment it was built in. Change them to match your own Prometheus and Loki datasources
-(Grafana → Connections → Data sources → the UID in the URL), or every panel comes up empty.
-
-Built against Grafana **10.2**, `schemaVersion 38`.
-
----
+⚠️ **Change the datasource UIDs before importing.** They are inlined in the JSON and still
+point at the environment it was built in. Replace them with your own Prometheus and Loki
+UIDs (Grafana → Connections → Data sources → the UID is in the URL) or every panel comes up
+empty. Built against Grafana 10.2, `schemaVersion 38`.
 
 ## Run it
 
 ```bash
-# 1. Generate the sample (or point --audit at real audit logs)
 cd splunk && python3 generate-sample.py --paths 500 --events 4000 --logins 1000 \
     --out samples/audit.jsonl
 
-# 2. Fold and publish
 cd .. && python3 scripts/vault-secret-aggregator.py \
     --audit       splunk/samples/audit.jsonl \
     --inventory   splunk/samples/vault_secret_inventory.csv \
@@ -67,54 +57,23 @@ cd .. && python3 scripts/vault-secret-aggregator.py \
     --print
 ```
 
-Drop `--pushgateway` and `--loki` to just print the table locally; that path needs nothing
-but Python 3.
+Drop `--pushgateway` and `--loki` to print the table locally; that needs nothing but Python 3.
 
-`--inventory` is **not optional.** A secret nobody has ever read emits no audit event, so it
-cannot appear in any log-derived view; it exists only in the baseline inventory. Without it
-the headline number is silently missing. The aggregator warns loudly if you omit it.
+**`--inventory` is not optional.** A secret nobody has ever read leaves no trace in the audit
+log, so nothing derived from logs can find it. It exists only in that file. Without it the
+headline number is silently wrong. The aggregator warns if you omit it.
 
-`--state-file` is the 18-month memory. In production it must be checkpointed; losing it
-resets the clock.
+**`--state-file` is the eighteen-month memory.** In production it has to be checkpointed to
+disk. Lose it and the clock resets to zero.
 
----
+## ⚠️ The findings table accumulates across runs
 
-## Verified
+Findings are pushed to Loki as log lines stamped now, so **every fold appends a fresh copy**.
+Two folds inside the dashboard's time window means every secret appears twice.
 
-| | ≤30d | ≤90d | ≤180d | ≤365d | ≤540d | never read | rotated but never read |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| Splunk SPL | 236 | 34 | 6 | 19 | 10 | **195** | **44** |
-| This aggregator | 235 | 35 | 6 | 19 | 10 | **195** | **44** |
+The quick fix is a Grafana `groupBy` transformation on secret path taking `lastNotNull` for
+the other columns, which makes the panel idempotent. The real fix is to stop using a log
+stream as a table: the aggregator's state belongs in SQLite or Postgres, queried directly.
 
-The one secret that shifts between the 30d and 90d bucket is the clock advancing between
-runs; that boundary is genuinely time-sensitive. `never read` and `rotated_but_never_read`
-are exact, and they are the two numbers that carry the story.
-
----
-
-## ⚠️ Known limitation: the findings table accumulates across runs
-
-Findings are pushed to Loki as log lines stamped **now**. That makes them cheap and dodges
-`reject_old_samples`, but **every fold appends a fresh copy**. If two folds land inside the
-dashboard's time window, every secret shows up twice.
-
-Workarounds, weakest to strongest:
-
-1. **Narrow the dashboard time range** so only the newest fold is in view (`&from=now-4m`).
-   Fine for a screenshot, fragile for daily use.
-2. **Add a Grafana `groupBy` transformation** on `secret path`, taking `lastNotNull` for every
-   other column. Makes the panel idempotent regardless of how many folds are in range.
-3. **Stop using a log stream as a table.** The aggregator's state table belongs in
-   SQLite/Postgres, queried directly by Grafana. A log stream is an append-only event record;
-   using it as current-state storage is a demo convenience, and this duplication is that
-   shortcut showing through.
-
-The **aggregate panels are unaffected**: Prometheus gauges are replaced wholesale on each
-push (`PUT /metrics/job/...`), so the tiles and histogram always reflect the latest fold only.
-
----
-
-## Framing
-
-The dashboard carries a **SAMPLE DATA banner** as its first panel. The data is synthetic; the
-schema is real. **Do not crop that banner out of a screenshot.**
+The aggregate panels are unaffected. Prometheus gauges are replaced wholesale on each push,
+so the tiles and the histogram always show the latest fold only.

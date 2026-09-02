@@ -126,7 +126,7 @@ additional ingest cost.
 ## 5. The baseline inventory is not optional
 
 **A secret nobody has ever read emits no audit event.** It cannot appear in any search over
-the audit index, because there is nothing to find. It exists only in a one-time path list.
+the audit log, because there is nothing to find. It exists only in a one-time path list.
 
 Skip that join and your dashboard shows a clean bill of health while the most important
 number, the count of secrets nothing has *ever* touched, is silently missing. There is no
@@ -152,23 +152,22 @@ headroom before anyone needs to reach for Go or Vector.
 
 **Neither CPU nor memory is the constraint.** The constraints are:
 
-1. **History.** "eighteen months" requires eighteen months of audit events to exist
+1. **History.** Answering "eighteen months" requires eighteen months of audit events to exist
    somewhere. Either replay them once from retained logs, or start the aggregator now and
    let the answer mature.
 2. **Baseline.** See §5.
 
 ---
 
-## 7. Known gotchas
+## 7. Four ways to get a silently wrong answer
 
-- **LogQL `| json a="x", b="y"` extracts only the fields you name.** Omit one you then group
-  by and it silently groups on empty string. Name every field you group by.
-- **Loki's `reject_old_samples` (default 168h) makes backfilling impossible.** Push computed
-  *findings stamped now* rather than trying to replay historical timestamps. A finding is an
-  observation made today about history, so "now" is also the honest timestamp.
-- **Splunk drops events older than the index freeze period at ingest.** If your audit index
-  is short, the old buckets come back empty and the whole thing looks broken when it isn't.
-  Check the earliest event before trusting any bucket; that is what `R1.0` is for.
-- **A findings *log stream* is not a table.** Every fold appends a fresh copy, so two folds
-  inside the dashboard's time window show every secret twice. Fine for a demo; in production
-  the state table belongs in SQLite or Postgres, queried directly.
+- **Naming too few fields in LogQL.** `| json a="x", b="y"` extracts only what you name.
+  Omit a field you then group by and it groups on empty string instead of erroring.
+- **Backfilling into Loki.** `reject_old_samples` (default 168h) drops historical
+  timestamps. Push findings stamped now instead.
+- **Short Splunk retention.** Splunk drops events older than the index freeze period at
+  ingest, so the old buckets come back empty and the whole thing looks broken. Check the
+  earliest event before trusting any bucket.
+- **Treating a log stream as a table.** Every fold appends a fresh copy of the findings, so
+  two folds in the window shows every secret twice. Fine for a demo; in production the state
+  table belongs in SQLite or Postgres.
