@@ -1,0 +1,20 @@
+# Generated sample data. Regenerate with splunk/generate-sample.py
+splunk/samples/
+*.jsonl
+vault_secret_inventory.csv
+
+# Aggregator state
+.state/
+*.state.json
+
+# Never commit a credential. If a file holds one, it does not belong in this repo.
+*.pem
+*.key
+.env
+.envrc
+
+# OS / editor
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc
