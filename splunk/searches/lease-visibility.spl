@@ -1,0 +1,118 @@
+========================================================================================
+ Credential lease visibility: Azure, AWS, Database secret engines
+========================================================================================
+ The question this answers: for every leased, expiring credential Vault currently has
+ issued, when was it created, and how many days until it expires.
+
+ STATUS: verified 2026-09-03 against a real Vault, a real Postgres backend, and real
+ issued leases. All 6 searches below executed against a live Splunk instance and
+ returned rows (or, for LV.5, a verified-correct empty result, see its own note).
+
+ WHY THIS IS NOT A SEARCH OVER index=vault_audit, AND CANNOT BE:
+ The Vault audit log never records a credential's expiry, at any layer. Verified: the
+ credential-issuance audit event has no lease_duration or expire_time field at all, only
+ a clear-text lease_id. The one API call that does return expiry (sys/leases/lookup)
+ HMACs its own lease_id in the audit log, both as input and output, so it cannot be
+ joined back to the clear-text lease_id from issuance. Role TTL config is HMAC'd too.
+ Expiry is simply not recoverable from the audit stream by any join.
+
+ What DOES work: polling Vault's live API directly. scripts/vault-lease-inventory.py
+ does this (LIST sys/leases/lookup/<mount>/creds/<role>/, then look up each lease ID for
+ its real issue_time/expire_time/ttl) and writes one JSON line per active lease, per
+ poll, to a file this index tails. Run it on a schedule: leases expire between polls, a
+ one-time snapshot goes stale within the shortest TTL in your estate.
+
+ ENGINE COVERAGE: only `database` has been tested end to end. `aws` and `azure` are
+ wired into the poller on the assumption they follow the same shape (both issue under
+ <mount>/creds/<role>, which is Vault's documented default), but that is UNVERIFIED.
+ Every row carries verified_engine=true/false; do not present an unverified row with the
+ same confidence as a verified one.
+
+ REPEATED-POLL DATA: this file is appended on every poll, so it accumulates history.
+ Every search below filters to the LATEST poll only, using
+     | eventstats max(polled_at) AS latest | where polled_at=latest
+ not the SPL `map` command. `map`'s `$field$` token substitution collides with Simple
+ XML dashboard token syntax (they use the identical $name$ form), which makes a
+ dashboard panel built on `map` hang forever showing "Search is waiting for input..."
+ even though no input is actually missing. Found by running the dashboard, not by
+ reading the SPL. Do not reintroduce `map` into a panel search in this file.
+
+ Assumes the poller output loaded as index=vault_leases sourcetype=vault:lease:snapshot.
+========================================================================================
+
+
+----------------------------------------------------------------------------------------
+ LV.0  Sanity check. Run this first.
+       If total is 0, either nothing has been polled yet, or the monitor input is not
+       pointed at the right file. If unverified_rows is nonzero, some of what follows
+       is from an engine type this has never been proven against.
+----------------------------------------------------------------------------------------
+index=vault_leases sourcetype=vault:lease:snapshot
+| stats count AS total,
+        sum(eval(if(verified_engine="false",1,0))) AS unverified_rows,
+        max(polled_at) AS last_poll
+| eval last_poll = strftime(last_poll, "%Y-%m-%d %H:%M:%S")
+
+
+----------------------------------------------------------------------------------------
+ LV.1  The current answer: latest poll only, one row per still-active lease
+       A file appended on every poll accumulates history. Reading it raw would show
+       every past poll's rows too, which makes an expired lease from an hour ago look
+       like it is still active. eventstats+where restricts to the latest poll.
+----------------------------------------------------------------------------------------
+index=vault_leases sourcetype=vault:lease:snapshot
+| eventstats max(polled_at) AS latest
+| where polled_at=latest
+| table mount role lease_id engine_type verified_engine days_to_expiry bucket renewable issue_time expire_time
+| eval issue_time=strftime(issue_time,"%Y-%m-%d %H:%M:%S"), expire_time=strftime(expire_time,"%Y-%m-%d %H:%M:%S")
+| sort + days_to_expiry
+
+
+----------------------------------------------------------------------------------------
+ LV.2  Headline counts, latest poll only
+----------------------------------------------------------------------------------------
+index=vault_leases sourcetype=vault:lease:snapshot
+| eventstats max(polled_at) AS latest
+| where polled_at=latest
+| stats count AS active_leases,
+        sum(eval(if(bucket="1 <=1h",1,0))) AS expiring_within_1h,
+        dc(mount) AS mounts_with_active_leases
+
+
+----------------------------------------------------------------------------------------
+ LV.3  By mount and role, latest poll only
+----------------------------------------------------------------------------------------
+index=vault_leases sourcetype=vault:lease:snapshot
+| eventstats max(polled_at) AS latest
+| where polled_at=latest
+| stats count AS active, avg(days_to_expiry) AS avg_days_to_expiry BY mount role
+| eval avg_days_to_expiry = round(avg_days_to_expiry, 2)
+| sort - active
+
+
+----------------------------------------------------------------------------------------
+ LV.4  Expiry trend across polls (needs the poller run on a schedule)
+       Uses every poll in range, deliberately, unlike LV.1-LV.3. Falls back to a single
+       point if only one poll has ever run. That is expected on a fresh install, not a
+       broken search.
+----------------------------------------------------------------------------------------
+index=vault_leases sourcetype=vault:lease:snapshot
+| eval poll_time = strftime(polled_at, "%Y-%m-%d %H:%M")
+| stats count AS active_leases,
+        sum(eval(if(bucket="1 <=1h",1,0))) AS expiring_soon
+        BY poll_time
+| sort poll_time
+
+
+----------------------------------------------------------------------------------------
+ LV.5  Which engines have never been verified, and how much of the estate they cover,
+       latest poll only.
+       If this returns rows, some fraction of what LV.1-LV.3 report is built on an
+       assumption (aws/azure follow the same shape as database) rather than a proof.
+       Say so out loud before presenting those numbers as fact. Verified 2026-09-03 to
+       correctly return EMPTY when only the database engine has ever been polled.
+----------------------------------------------------------------------------------------
+index=vault_leases sourcetype=vault:lease:snapshot verified_engine=false
+| eventstats max(polled_at) AS latest
+| where polled_at=latest
+| stats count AS unverified_leases BY engine_type mount

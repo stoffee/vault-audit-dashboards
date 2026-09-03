@@ -10,6 +10,7 @@ The same answers without Splunk: identical numbers, identical dataset, no SIEM i
 |---|---|
 | [Find stale secrets](scenarios/01-find-stale-secrets.md) | The cleanup list, and the one input without which the headline number is silently wrong |
 | [Denied requests](scenarios/02-denied-requests.md) | A rising denial count against one path, worth an alert |
+| [Credential lease visibility](scenarios/03-credential-lease-visibility.md) | Azure/AWS/Database, live-polled not audit-folded. Only Database is verified |
 
 ## Architecture
 
@@ -47,8 +48,14 @@ API), so there is no scrape config to edit and no existing pipeline to touch.
 | File | What it is |
 |---|---|
 | `dashboards/vault-secret-hygiene.json` | 8-panel dashboard. Prometheus for aggregates, Loki for the findings and denial tables |
-| `scripts/vault-secret-aggregator.py` | The fold. stdlib only, no dependencies |
-| `scripts/tests/` | Fixture-based tests, `python3 scripts/tests/test_aggregator.py` |
+| `dashboards/vault-lease-visibility.json` | 7-panel dashboard for leased credentials (Azure/AWS/Database). Live-polled, not audit-folded, see below |
+| `scripts/vault-secret-aggregator.py` | The KV hygiene fold. Grafana-only: Splunk does this fold itself in SPL |
+| `scripts/tests/test_aggregator.py` | Fixture-based tests for the aggregator above |
+
+`scripts/vault-lease-inventory.py` is the lease poller behind the dashboard above.
+Splunk needs its own separate copy (scripted inputs can only run from an app's own
+`bin/`), so treat this one as the source of truth and keep them in sync by hand if you
+change it. See [Credential lease visibility](scenarios/03-credential-lease-visibility.md).
 
 ⚠️ **Change the datasource UIDs before importing.** They are inlined in the JSON and still
 point at the environment it was built in. Replace them with your own Prometheus and Loki
@@ -124,6 +131,16 @@ Root is normalized specially: Vault's root namespace has the fixed id `"root"`, 
 empty one, so without normalization an id-only device would produce keys like
 `"rootkv/data/app/db"` while a path-based device produces `"kv/data/app/db"` for the same
 secret. Both now resolve to the same key.
+
+## Credential lease visibility (Azure / AWS / Database)
+
+A separate tool, `scripts/vault-lease-inventory.py`, because it is a separate problem.
+The audit log never records lease expiry, at any layer, verified against a real Vault
+and a real issued credential. See
+[Credential lease visibility](scenarios/03-credential-lease-visibility.md) for the full
+finding and how to run the poller. Only the `database` engine has been proven end to
+end; AWS and Azure rows on the dashboard are flagged `UNVERIFIED ENGINE` rather than
+presented with equal confidence.
 
 ## ⚠️ The findings table accumulates across runs
 

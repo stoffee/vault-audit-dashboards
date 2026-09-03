@@ -30,6 +30,7 @@ Step by step, with what each result means and where it can mislead you.
 | [Trace a transaction](splunk/scenarios/02-trace-a-transaction.md) | From a secret out to its consumers, or from a workload in to everything it touched |
 | [Find stale secrets](splunk/scenarios/03-find-stale-secrets.md) | The cleanup list, and the one input without which the headline number is silently wrong |
 | [Where is my audit volume coming from?](splunk/scenarios/04-where-is-my-audit-volume.md) | Turning "the logs are too big" into an evidence-based filtering argument |
+| [Credential lease visibility](splunk/scenarios/05-credential-lease-visibility.md) | Azure/AWS/Database: live-polled, not audit-folded, because the audit log cannot record expiry |
 
 ## What you need
 
@@ -48,7 +49,8 @@ splunk/
   scenarios/      The walkthroughs above
 grafana/
   dashboards/     Dashboard JSON
-  scripts/        The aggregator that feeds them
+  scripts/        The KV hygiene aggregator, plus the credential lease poller
+                  (Splunk keeps its own copy at splunk-app/.../bin/, source of truth here)
 docs/             How it works, and how to test it
 ```
 

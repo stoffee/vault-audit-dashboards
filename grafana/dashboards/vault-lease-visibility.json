@@ -1,0 +1,421 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Active leased credentials from Azure/AWS/Database secret engines, polled live from Vault's lease store. This is NOT folded from the audit log: the audit log never records lease expiry (verified; see the repo's lease-visibility spec). scripts/vault-lease-inventory.py polls sys/leases/lookup directly instead.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "mode": "html",
+        "content": "<div style=\"padding:8px 12px;background:#eef4fa;border-left:4px solid #006d9c;color:#333;font-family:inherit;\"><b>Live-polled, not audit-folded.</b> Vault's audit log never records lease expiry, at any layer (verified against a real issued credential). This dashboard polls the live lease store instead. <b>Only the Database engine has been verified end to end.</b> AWS and Azure use the same poller but their audit/API shapes are unconfirmed; rows from those engines are flagged.</div>"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Active leased credentials",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 4
+      },
+      "id": 2,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vault_lease_total{job=\"vault-lease-inventory\"}",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Expiring within 1 hour",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 4
+      },
+      "id": 3,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vault_lease_expiry_bucket{job=\"vault-lease-inventory\", bucket=\"1 <=1h\"}",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Lookup failures last poll (expired mid-scan, expected)",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 4
+      },
+      "id": 4,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vault_lease_poll_lookup_failures{job=\"vault-lease-inventory\"}",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "Active leases by days-to-expiry bucket",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 5,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vault_lease_expiry_bucket{job=\"vault-lease-inventory\"}",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "format": "table",
+          "legendFormat": "{{bucket}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "type": "piechart",
+      "title": "Active leases by mount and role",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 6,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vault_lease_expiry_by_mount_role{job=\"vault-lease-inventory\", role=~\"$role\"}",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "legendFormat": "{{mount}}/{{role}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "title": "Individual credentials (worst first). Metadata only: no credential value exists in this data.",
+      "description": "Per-lease findings emitted by the poller as Loki log LINES: per-lease detail without per-lease label cardinality.",
+      "gridPos": {
+        "h": 13,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 7,
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"vault-lease-inventory\"}",
+          "queryType": "range",
+          "maxLines": 500
+        }
+      ],
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": false
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "lease_id": {
+                "aggregations": [],
+                "operation": "groupby"
+              },
+              "mount": {
+                "aggregations": [
+                  "lastNotNull"
+                ],
+                "operation": "aggregate"
+              },
+              "role": {
+                "aggregations": [
+                  "lastNotNull"
+                ],
+                "operation": "aggregate"
+              },
+              "bucket": {
+                "aggregations": [
+                  "lastNotNull"
+                ],
+                "operation": "aggregate"
+              },
+              "days_to_expiry": {
+                "aggregations": [
+                  "lastNotNull"
+                ],
+                "operation": "aggregate"
+              },
+              "renewable": {
+                "aggregations": [
+                  "lastNotNull"
+                ],
+                "operation": "aggregate"
+              },
+              "verified_engine": {
+                "aggregations": [
+                  "lastNotNull"
+                ],
+                "operation": "aggregate"
+              }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Line": true,
+              "labels": true,
+              "tsNs": true,
+              "id": true,
+              "Time": true,
+              "job": true,
+              "engine_type": true,
+              "lease_id": false
+            },
+            "indexByName": {
+              "mount (lastNotNull)": 0,
+              "role (lastNotNull)": 1,
+              "lease_id": 2,
+              "days_to_expiry (lastNotNull)": 3,
+              "bucket (lastNotNull)": 4,
+              "renewable (lastNotNull)": 5,
+              "verified_engine (lastNotNull)": 6
+            },
+            "renameByName": {
+              "mount (lastNotNull)": "mount",
+              "role (lastNotNull)": "role",
+              "days_to_expiry (lastNotNull)": "days to expiry",
+              "bucket (lastNotNull)": "bucket",
+              "renewable (lastNotNull)": "renewable",
+              "verified_engine (lastNotNull)": "engine verified"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "days to expiry (lastNotNull)",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "engine verified"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "true": {
+                        "text": "verified",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "false": {
+                        "text": "UNVERIFIED ENGINE",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "vault",
+    "audit",
+    "leases"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "role",
+        "label": "Role",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "query": "label_values(vault_lease_expiry_by_mount_role{job=\"vault-lease-inventory\"}, role)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "Vault Credential Lease Visibility: Azure / AWS / Database",
+  "uid": "vault-lease-visibility",
+  "version": 1,
+  "weekStart": ""
+}

@@ -81,6 +81,7 @@ Step by step, with what each result means and where it can mislead you.
 | [Trace a transaction](scenarios/02-trace-a-transaction.md) | A secret out to its consumers, or a workload in to what it touched |
 | [Find stale secrets](scenarios/03-find-stale-secrets.md) | The cleanup list |
 | [Where is my audit volume coming from?](scenarios/04-where-is-my-audit-volume.md) | The filtering argument, with numbers |
+| [Credential lease visibility](scenarios/05-credential-lease-visibility.md) | Azure/AWS/Database, live-polled not audit-folded. Only Database is verified |
 
 ## The searches
 
@@ -96,6 +97,7 @@ data is shaped the way the rest of the file assumes, before any number can misle
 | `policy-trending.spl` | Policy operation rate, top policies, policy growth |
 | `nightly-batch-spike.spl` | Time-of-day baseline, so on-call can tell normal from incident |
 | `tls-noise.spl` | TLS handshake flooding, health checker versus scan |
+| `lease-visibility.spl` | Leased credentials (Azure/AWS/Database): issued, expiring. Reads a different index; see below |
 
 ⚠️ **`tls-noise.spl` does not read the audit log.** TLS handshakes fail before Vault ever
 writes an audit entry. It needs Vault *server* logs. Pointed at the audit index it renders
@@ -122,6 +124,17 @@ are a literal string that matches nothing, so the column silently disappears:
 | stats count BY 'request.operation'    <- 0 rows
 | stats count BY request.operation      <- correct
 ```
+
+## Credential lease visibility is a different pipeline
+
+`lease-visibility.spl` does not read `index=vault_audit`. It reads `index=vault_leases`,
+fed by a Splunk **scripted input** (`bin/vault-lease-inventory.py`, shipped with the
+app) polling Vault's live API on Splunk's own schedule, because the audit log never
+records a credential's expiry at any layer (verified). No external cron: Splunk runs
+it and reads its stdout directly, and the Vault token lives in Splunk's own credential
+store, never in a config file. See
+[Credential lease visibility](scenarios/05-credential-lease-visibility.md) for the
+finding and how to set it up. Only the `database` engine has been proven end to end.
 
 ## Scale
 
