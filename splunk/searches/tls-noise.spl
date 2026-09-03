@@ -1,0 +1,314 @@
+========================================================================================
+ the TLS-noise searches: TLS handshake log noise, in SPL
+========================================================================================
+ The question these answer: TLS handshake errors are flooding the log pipeline and
+ inflating SIEM ingest cost. Nobody has quantified the VOLUME or identified the SOURCE.
+ And the operational question underneath it is a fork:
+
+     a misconfigured load balancer health check   -> fix the health check, done
+     an actual port scan                          -> a security response
+
+ Those look identical in a raw error count. They are trivially separable once you look
+ at per-source-IP timing, because a health checker is regular and a scanner is not.
+
+ STATUS: parse-checked only. The SPL is syntactically valid, but NOTHING here has been
+ executed against data, because the operational-log source it needs did not exist in the
+ test environment. Every other file in this repo has been run. This one has not, and the
+ reason is the section immediately below: these searches do not read the audit log.
+
+
+========================================================================================
+ READ THIS BEFORE YOU RUN ANYTHING: this is NOT the audit log
+========================================================================================
+ Every other search in this repo reads index=vault_audit sourcetype=vault:audit.
+ THESE DO NOT, AND THEY CANNOT.
+
+ The audit device records authenticated requests that REACHED Vault and were processed.
+ A TLS handshake fails before any of that happens. There is no request, no token, no
+ audit entry. The error is written by the server's HTTP listener to the operational
+ log (stdout / syslog / journald), which is a completely different stream.
+
+     operational log   TLS handshake errors live here    <- what the TLS-noise searches needs
+     audit device      authenticated requests only       <- everything else in this repo
+
+ Point an the TLS-noise searches panel at index=vault_audit and it will render perfectly and show zero,
+ forever, with no error. That is the worst possible failure mode: a dashboard that looks
+ healthy because it is looking in a place the data can never be.
+
+ So these searches use a PLACEHOLDER source that you must replace:
+
+     index=vault_operational sourcetype=vault:server
+
+ Substitute whatever index and sourcetype your log shipper writes the Vault server's
+ stdout/syslog into. If your pipeline forwards only the audit device today, then the
+ operational stream is not in the SIEM at all and no query will fix that; the shipper
+ config has to tee it first.
+
+ A useful side effect: because the operational stream is separate, filtering the noise
+ out of it at the forwarder does not touch the audit trail, and therefore does not
+ affect audit or compliance retention. See 8.6.
+
+ Also note these searches match on raw text, not parsed fields. Operational log format
+ varies by Vault version and by whether the server is running in JSON log mode. Confirm
+ with 8.0 that your lines actually contain these strings before trusting any count.
+========================================================================================
+
+
+----------------------------------------------------------------------------------------
+ 8.0  Does the operational stream exist, and what do the error lines look like?
+       RUN THIS FIRST. If this returns nothing, you have not found the operational log,
+       and every panel below will report a clean zero that means "never looked".
+       Do not proceed on a zero here. Fix the source first.
+----------------------------------------------------------------------------------------
+index=vault_operational sourcetype=vault:server
+    ("TLS handshake error" OR "tls:")
+| head 20
+| table _time host _raw
+
+/*  Two error strings matter, and they mean different things:
+
+      "http: TLS handshake error from <ip>:<port>: ..."
+          the general form; the tail says why
+
+      "tls: first record does not look like a TLS handshake"
+          the specific one that means a PLAIN TCP connection hit the TLS port. This is
+          the signature of a TCP-mode health check, or of a scanner banner-grabbing.
+          It is not a certificate problem and no cert change will make it stop.
+
+    Other tails you will see, which are NOT the same finding: "remote error: tls: bad
+    certificate" (a real client with the wrong cert), "EOF" (a connection dropped
+    mid-handshake), "client offered only unsupported versions" (an old client).
+    Separate them in 8.2 rather than lumping them together.                          */
+
+
+----------------------------------------------------------------------------------------
+ 8.1  VOLUME: how many, over time, per host
+       The number to put in front of whoever owns the ingest bill.
+----------------------------------------------------------------------------------------
+index=vault_operational sourcetype=vault:server
+    "TLS handshake error"
+| timechart span=1h count BY host
+
+/*  A dead flat line per host is itself a finding. Genuine client errors are bursty and
+    follow deployments. A constant rate is machinery: health checks, or a scanner on a
+    cron. Flatness alone nearly answers the question before any of the analysis below. */
+
+
+----------------------------------------------------------------------------------------
+ 8.2  Break the errors out by reason
+       Because the responses are different. A flood of "does not look like a TLS
+       handshake" is a config fix. A flood of "bad certificate" is a client that is
+       genuinely trying and failing, and suppressing that one hides a real outage.
+----------------------------------------------------------------------------------------
+index=vault_operational sourcetype=vault:server
+    ("TLS handshake error" OR "tls:")
+| rex field=_raw "TLS handshake error from (?<src_ip>[0-9a-fA-F\.:]+):(?<src_port>\d+)"
+| eval reason = case(
+      match(_raw, "first record does not look like a TLS handshake"), "plaintext on TLS port",
+      match(_raw, "bad certificate"),                                 "client cert rejected",
+      match(_raw, "unknown certificate"),                             "client rejected our cert",
+      match(_raw, "unsupported versions"),                            "obsolete TLS version",
+      match(_raw, "EOF"),                                             "connection dropped mid-handshake",
+      match(_raw, "TLS handshake error"),                             "other handshake error",
+      true(),                                                          "unclassified")
+| stats count AS errors, dc(src_ip) AS distinct_sources, dc(host) AS vault_nodes
+        BY reason
+| eventstats sum(errors) AS total
+| eval share_pct = round(100 * errors / total, 1)
+| fields reason errors share_pct distinct_sources vault_nodes
+| sort - errors
+
+/*  The rex is the load-bearing line in this whole file. If distinct_sources comes back
+    null or 0 while errors is large, the regex did not match your log format and every
+    per-IP panel below is empty for that reason and not because there are no sources.
+    Check a raw line from 8.0 and adjust the pattern. IPv6 sources are why the
+    character class includes ':'; a v6 address plus port needs a different anchor, so
+    if your listener is dual-stack, verify against a real v6 line.                     */
+
+
+----------------------------------------------------------------------------------------
+ 8.3  ATTRIBUTION: which source IPs, and how do they behave
+       Raw counts per IP are not enough to answer the fork, so this measures the
+       BEHAVIOUR of each source alongside its volume.
+
+       The discriminator is interval regularity. A health checker fires on a timer, so
+       the gaps between its connections are near identical and the stdev of those gaps
+       is tiny. A human or a scanning tool produces irregular gaps.
+----------------------------------------------------------------------------------------
+index=vault_operational sourcetype=vault:server
+    "TLS handshake error"
+| rex field=_raw "TLS handshake error from (?<src_ip>[0-9a-fA-F\.:]+):(?<src_port>\d+)"
+| where isnotnull(src_ip)
+| sort 0 src_ip _time
+| streamstats current=f last(_time) AS prev_time BY src_ip
+| eval gap = _time - prev_time
+| stats count AS errors,
+        avg(gap) AS avg_gap, stdev(gap) AS gap_stdev,
+        dc(host) AS vault_nodes_hit,
+        dc(src_port) AS distinct_src_ports,
+        min(_time) AS first_seen, max(_time) AS last_seen
+        BY src_ip
+| eval duration_h = round((last_seen - first_seen)/3600, 1),
+       avg_gap    = round(avg_gap, 1),
+       gap_stdev  = round(gap_stdev, 1)
+
+  ``` coefficient of variation: stdev relative to the mean. Near 0 is a metronome. ```
+| eval gap_cv = if(avg_gap > 0, round(gap_stdev / avg_gap, 2), null())
+
+| eval first_seen = strftime(first_seen,"%F %T"), last_seen = strftime(last_seen,"%F %T")
+| table src_ip errors avg_gap gap_cv duration_h vault_nodes_hit distinct_src_ports first_seen last_seen
+| sort - errors
+| head 50
+
+/*  streamstats needs the events ordered by IP then time, hence the explicit
+    `sort 0 src_ip _time`. The 0 means no result limit; the default sort caps at 10000
+    rows and would silently truncate a real flood.
+
+    Reading the table:
+      low gap_cv + long duration_h + few src_ports   -> a timer. Health check.
+      high gap_cv + short duration_h + many ports    -> a burst. Scan.               */
+
+
+----------------------------------------------------------------------------------------
+ 8.4  THE PANEL: separate the two populations
+       8.3 gives a human the evidence. This one makes the call, so the dashboard says
+       what to do rather than making on-call derive it at 3am.
+
+       Thresholds here are starting values, not physics. Tune them against 8.3 output
+       from your own estate before wiring anything to an alert.
+----------------------------------------------------------------------------------------
+index=vault_operational sourcetype=vault:server
+    "TLS handshake error"
+| rex field=_raw "TLS handshake error from (?<src_ip>[0-9a-fA-F\.:]+):(?<src_port>\d+)"
+| where isnotnull(src_ip)
+| sort 0 src_ip _time
+| streamstats current=f last(_time) AS prev_time BY src_ip
+| eval gap = _time - prev_time
+| stats count AS errors,
+        avg(gap) AS avg_gap, stdev(gap) AS gap_stdev,
+        dc(src_port) AS distinct_src_ports,
+        dc(host) AS vault_nodes_hit,
+        min(_time) AS first_seen, max(_time) AS last_seen
+        BY src_ip
+| eval duration_h = (last_seen - first_seen)/3600,
+       gap_cv     = if(avg_gap > 0, gap_stdev / avg_gap, 99)
+
+| eval population = case(
+
+      ``` metronome timing sustained over hours, from one IP, is machinery on a timer.
+          This is the population that should be fixed at the load balancer, not alerted on. ```
+      gap_cv < 0.25 AND duration_h > 6 AND errors > 20, "HEALTH CHECKER (fix the config)",
+
+      ``` many source ports in a short window is the shape of a port sweep or a
+          connection flood. One client reconnecting normally does not do this. ```
+      distinct_src_ports > 100 AND duration_h < 1, "SCAN (investigate)",
+
+      ``` irregular and short lived. Not a timer, not obviously a sweep either. ```
+      gap_cv >= 1 AND duration_h < 2, "BURSTY (investigate)",
+
+      true(), "UNCLASSIFIED (eyeball it)")
+
+| eval avg_gap = round(avg_gap,1), gap_cv = round(gap_cv,2), duration_h = round(duration_h,1)
+| stats sum(errors) AS errors, dc(src_ip) AS source_ips, values(src_ip) AS ips BY population
+| eventstats sum(errors) AS total
+| eval share_pct = round(100 * errors / total, 1)
+| fields population errors share_pct source_ips ips
+| sort - errors
+
+/*  Deliberately conservative. UNCLASSIFIED is a legitimate output and it is better than
+    a confident wrong label, because the two labels here lead to opposite responses and
+    calling a scan a health check is the expensive mistake.
+
+    A single IP does not have to be one thing forever. A load balancer that is ALSO
+    being scanned shows up as one IP with a mixed profile, which lands in UNCLASSIFIED,
+    which is the correct place for it.
+
+    `values(src_ip)` will be truncated at 100 by default. Fine for HEALTH CHECKER, which
+    is a small stable set by definition. For SCAN drop the ips column and use 8.3.    */
+
+
+----------------------------------------------------------------------------------------
+ 8.5  COST: what share of ingest is this noise
+       The panel that justifies doing anything about it. Two forms below.
+
+       Form A uses the license usage index, which is the authoritative number but needs
+       access to _internal. Form B estimates from line size and needs no special access.
+----------------------------------------------------------------------------------------
+
+ Form A: measured against actual licensed ingest volume
+index=_internal source=*license_usage.log type=Usage
+    earliest=-7d@d latest=@d
+| stats sum(b) AS bytes BY st
+| eventstats sum(bytes) AS total_bytes
+| eval gb = round(bytes/1024/1024/1024, 2),
+       share_pct = round(100 * bytes / total_bytes, 2)
+| sort - bytes
+| head 20
+
+/*  Locate your operational sourcetype in that list to see what the whole stream costs.
+    Then Form B tells you what fraction of it is handshake noise.                      */
+
+
+ Form B: estimate the noise share from the line sizes themselves
+index=vault_operational sourcetype=vault:server
+    earliest=-7d@d latest=@d
+| eval is_tls_noise = if(match(_raw, "TLS handshake error"), 1, 0)
+| eval bytes = len(_raw)
+| stats count AS events, sum(bytes) AS bytes BY is_tls_noise
+| eventstats sum(events) AS total_events, sum(bytes) AS total_bytes
+| eval category   = if(is_tls_noise==1, "TLS handshake noise", "everything else"),
+       gb_7d      = round(bytes/1024/1024/1024, 3),
+       gb_per_day = round(bytes/1024/1024/1024/7, 3),
+       gb_year    = round(bytes/1024/1024/1024/7*365, 1),
+       pct_events = round(100 * events / total_events, 1),
+       pct_bytes  = round(100 * bytes / total_bytes, 1)
+| fields category events pct_events gb_7d gb_per_day gb_year pct_bytes
+| sort - gb_7d
+
+/*  len(_raw) is the uncompressed line length, which is the right basis: Splunk licenses
+    on raw ingested volume. It still UNDERSTATES the real cost, because it ignores
+    per-event index overhead and the storage the events occupy for the whole retention
+    period, not just the day they arrive. Treat gb_year as a floor.
+
+    To turn it into currency, multiply gb_year by your own per-GB rate. No rate is
+    hardcoded here, because that number is different for every deployment and a stale
+    hardcoded price in a public repo is worse than no price.                          */
+
+
+----------------------------------------------------------------------------------------
+ 8.6  What to actually do about it
+       Not a search. The searches above quantify a problem; this is the fix, and the
+       order matters.
+----------------------------------------------------------------------------------------
+
+/*  1. FIX THE SOURCE FIRST, if 8.4 says HEALTH CHECKER.
+       "plaintext on TLS port" from a load balancer means the health check is doing a
+       bare TCP connect against an HTTPS listener. Vault sees an unencrypted byte
+       stream on a TLS port and logs an error, correctly. Point the health check at
+       HTTPS and Vault's own health endpoint instead, and the errors stop at the
+       source, which costs nothing to run and needs no filter to maintain.
+
+       When you do, treat BOTH of these as healthy: the active node and a standby node
+       answer that endpoint with different status codes, and a health check that accepts
+       only one of them will mark healthy standbys as down.
+
+    2. FILTER AT THE FORWARDER ONLY IF YOU CANNOT FIX THE SOURCE.
+       Dropping at the log shipper (a grep/exclude filter on the operational stream)
+       means the events never become billable. Dropping in Splunk at index time via
+       nullQueue does NOT: the data has already crossed the license meter.
+
+       Two cautions. Filtering is permanent for those events, so route them to a
+       cheap long-retention destination instead of deleting outright if you might ever
+       need them for forensics. And match narrowly on the specific handshake string,
+       never on "tls", or you will also drop the certificate expiry warnings that are
+       the ones you genuinely want.
+
+    3. DO NOT FILTER IF 8.4 SAYS SCAN.
+       Suppressing the log of an active scan is deleting the evidence. Route it to a
+       security index, do not drop it.
+
+    4. THE AUDIT TRAIL IS NOT AFFECTED, EITHER WAY.
+       All of this is the operational stream. The audit device is a separate output and
+       nothing here touches it, so audit and compliance retention are unchanged.
+       Worth saying out loud to whoever has to approve the filter, because "we are
+       going to stop logging some errors" sounds much worse than it is.               */

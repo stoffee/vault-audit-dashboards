@@ -1,0 +1,244 @@
+========================================================================================
+ Nightly batch spike visibility, in SPL
+========================================================================================
+ The question these answer: a request-rate spike is showing up around midnight every
+ night. Is this the scheduled batch jobs doing what they always do, or is tonight
+ different? On-call cannot tell those apart from a raw rate graph, so the spike gets
+ ignored, and an ignored alert is a broken alert.
+
+ The fix is not to suppress the spike. It is to draw "normal for this hour" next to it,
+ so an abnormal spike is visually obvious and a normal one is visibly normal.
+
+ STATUS: verified 2026-09-02. All 7 searches executed against Splunk 10.4.3 and
+ returned rows. Whether they show a MEANINGFUL spike depends entirely on your data: if
+ your estate has no nightly batch window, the baseline is flat and that is the correct
+ answer, not a broken search.
+
+ A FLAT LINE IS A VALID RESULT. If your estate has no scheduled batch window, the
+ hour-of-day baseline is flat and that is the correct answer. These panels are worth
+ nothing until you have enough whole days of history to build a baseline from: run the
+ density check first, and do not read a trend off two days of data.
+
+ Assumes the sample loaded as index=vault_audit sourcetype=vault:audit with KV_MODE=json.
+ Against your own estate the index and sourcetype will differ. Only the first line of
+ each search changes.
+
+ Nested JSON fields are referenced as 'request.path' (single quotes) inside eval/where,
+ and as request.path=... in the base search.
+========================================================================================
+
+
+----------------------------------------------------------------------------------------
+ 9.0  Sanity check: is there enough density to have an hour-of-day shape at all?
+       RUN THIS FIRST. A baseline averaged over N days is meaningless if the window
+       holds only a handful of events per day. events_per_day well under a few thousand
+       means every panel below is averaging noise.
+
+       Also check hours_covered is 24. If your retention window is shorter than a full
+       day the "baseline" is only the hours you happen to have.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+    earliest=-30d@d latest=@d
+| eval day = strftime(_time,"%F"), hour = strftime(_time,"%H")
+| stats count AS events, dc(day) AS days, dc(hour) AS hours_covered,
+        min(_time) AS earliest, max(_time) AS latest
+| eval events_per_day = round(events/days, 0),
+       earliest = strftime(earliest,"%F %T"),
+       latest   = strftime(latest,"%F %T")
+
+
+----------------------------------------------------------------------------------------
+ 9.1  THE BASELINE: average request rate by hour-of-day
+       This is the reference curve every other panel compares against. Averaged over
+       whole days only (earliest=-30d@d latest=@d), because a partial trailing day
+       drags the hours it does not cover down toward zero and bends the curve.
+
+       stdev comes along for free here and it is what turns "higher than average" into
+       "outside normal variation". A midnight batch window that always runs is a high
+       mean with a LOW stdev, which is exactly the signature of boring and expected.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+    earliest=-30d@d latest=@d
+| bin _time span=1h
+| stats count AS requests BY _time
+| eval hour = strftime(_time,"%H")
+| stats avg(requests) AS baseline_rate,
+        stdev(requests) AS baseline_stdev,
+        max(requests) AS observed_max,
+        count AS days_sampled
+        BY hour
+| eval baseline_rate  = round(baseline_rate, 0),
+       baseline_stdev = round(baseline_stdev, 0),
+       upper_normal   = round(baseline_rate + 2*baseline_stdev, 0)
+| sort hour
+
+/*  Read the batch window straight off this table: the hours where baseline_rate is
+    high AND baseline_stdev is low are the scheduled work. Consistency is the tell.
+    An hour with a high mean and a high stdev is not a schedule, it is intermittent
+    load, and it will never be a clean alert no matter how you threshold it.        */
+
+
+----------------------------------------------------------------------------------------
+ 9.2  THE PANEL: today overlaid on the baseline
+       The one panel this requirement exists for. Two series on one hour-of-day axis:
+       what normally happens, and what is happening now.
+
+       Structure note: appendcols is deliberately NOT used here. It joins by row
+       position, so if today has no events at all in some hour that row silently
+       shifts and every subsequent hour is compared against the wrong baseline. The
+       append + stats pattern below keys on `hour`, so a missing hour stays missing.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+    earliest=-30d@d latest=@d
+| bin _time span=1h
+| stats count AS requests BY _time
+| eval hour = strftime(_time,"%H")
+| stats avg(requests) AS baseline_rate, stdev(requests) AS baseline_stdev BY hour
+
+| append [
+    search index=vault_audit sourcetype=vault:audit type=response
+        earliest=@d latest=now
+    | bin _time span=1h
+    | stats count AS today_rate BY _time
+    | eval hour = strftime(_time,"%H")
+    | fields hour today_rate
+  ]
+
+| stats max(baseline_rate)  AS baseline_rate,
+        max(baseline_stdev) AS baseline_stdev,
+        max(today_rate)     AS today_rate
+        BY hour
+| eval baseline_rate  = round(baseline_rate, 0),
+       upper_normal   = round(baseline_rate + 2*baseline_stdev, 0),
+       lower_normal   = round(max(0, baseline_rate - 2*baseline_stdev), 0)
+| sort hour
+| fields hour today_rate baseline_rate lower_normal upper_normal
+
+/*  Chart as a line chart. today_rate against baseline_rate, with lower_normal and
+    upper_normal as the band. Hours where today_rate sits inside the band are the
+    answer to "is this the batch job", and it is an answer on-call can read in one
+    second without knowing anything about the schedule.
+
+    Hours later than now() have no today_rate. Leave them null rather than filling
+    zero: a zero draws a line down to the axis and reads as an outage.               */
+
+
+----------------------------------------------------------------------------------------
+ 9.3  Same comparison via timewrap: day over day, real clock time
+       timewrap is the terser way to get "today vs the last 7 days" and it keeps real
+       timestamps rather than folding to an hour-of-day axis. Use this one when the
+       question is "was LAST night different from the night before", and use 9.2 when
+       the question is "what is normal for this hour".
+
+       timewrap is a Splunk core search command; no app needed. It must follow a
+       timechart, and the search time range must cover every period being wrapped,
+       hence earliest=-8d@d for 7 series plus today.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+    earliest=-8d@d latest=now
+| timechart span=1h count AS requests
+| timewrap 1d series=short
+
+/*  Output is one column per day (s0 = today, s1 = yesterday, ...) on a shared
+    hour axis. The nightly spike shows as all series rising together at the same hour.
+    A real incident shows as ONE series departing from the bundle, which is the
+    visual on-call actually needs.                                                   */
+
+
+----------------------------------------------------------------------------------------
+ 9.4  WHO drives the nightly spike: auth methods and identities, batch window only
+       Attribution. Once the spike is confirmed normal, this is the panel that names
+       the scheduled jobs causing it, so the next person does not have to rediscover
+       them. Adjust the hour window to whatever 9.1 showed as the batch hours.
+
+       The night_share column is the point. An identity at ~100% night_share runs
+       ONLY in the batch window, which makes it a scheduled job. An identity near the
+       overall traffic share is just normal load that happens to also run at night.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+    earliest=-30d@d latest=@d
+| eval hour = tonumber(strftime(_time,"%H"))
+| eval window = if(hour >= 23 OR hour < 2, "night", "day")
+| eval who        = coalesce('auth.metadata.service_account_name', 'auth.display_name', "unknown"),
+       method     = 'request.mount_type',
+       source_ip  = 'request.remote_address'
+| stats count AS total,
+        count(eval(window=="night")) AS night_requests,
+        dc(source_ip) AS source_ips,
+        values(method) AS methods,
+        max(_time) AS last_seen
+        BY who
+| eval night_share = round(100 * night_requests / total, 1),
+       last_seen   = strftime(last_seen,"%F %T")
+| where night_requests > 0
+| sort - night_requests
+| head 50
+
+/*  Cross-check with the auth-method traffic search in stale-secrets.spl. If the
+    night spike is one auth method it is almost always one platform's scheduler.      */
+
+
+----------------------------------------------------------------------------------------
+ 9.5  WHICH paths the batch window touches
+       Follows 9.4: having named the identity, name what it reads. Feeds directly into
+       the stale-secret searches, because a batch job hammering a path is also the reason that path never looks
+       dormant.
+
+       The coalesce on the namespace is mandatory. The root namespace carries
+       request.namespace.path as an EMPTY STRING, and a bare concatenation with it
+       yields null, dropping every root-namespace event with no error at all.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+    request.mount_type=kv request.path="*/data/*"
+    earliest=-30d@d latest=@d
+| eval hour = tonumber(strftime(_time,"%H"))
+| where hour >= 23 OR hour < 2
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval who = coalesce('auth.metadata.service_account_name', 'auth.display_name', "unknown")
+| stats count AS night_requests, dc(who) AS distinct_callers, values(request.operation) AS ops
+        BY secret
+| sort - night_requests
+| head 50
+
+
+----------------------------------------------------------------------------------------
+ 9.6  DEVIATION FROM BASELINE: the alertable form
+       This is what a detection rule should fire on, not a raw rate threshold. A fixed
+       "alert above N requests/hour" threshold is precisely what the batch spike breaks:
+       set it above the nightly peak and you are blind all day, set it below and it
+       pages every midnight.
+
+       z is the deviation in standard deviations for THIS hour of the day, so the same
+       single number works at 03:00 and at 14:00.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+    earliest=-30d@d latest=now
+| bin _time span=1h
+| stats count AS requests BY _time
+| eval hour = strftime(_time,"%H")
+| eventstats avg(requests) AS baseline_rate, stdev(requests) AS baseline_stdev BY hour
+| eval baseline_stdev = if(baseline_stdev == 0 OR isnull(baseline_stdev), 1, baseline_stdev)
+| eval z = round((requests - baseline_rate) / baseline_stdev, 2)
+| eval verdict = case(
+      z >=  3, "ABNORMAL: far above normal for this hour",
+      z >=  2, "elevated for this hour",
+      z <= -3, "ABNORMAL: far below normal, check for an outage",
+      true(),  "within normal range for this hour")
+| eval baseline_rate = round(baseline_rate, 0)
+| table _time hour requests baseline_rate z verdict
+| sort - _time
+
+/*  Two things to get right before this becomes an alert:
+
+    1. The baseline window includes the hour being scored, so a large sustained spike
+       slowly teaches the baseline that it is normal. For a real detection, compute the
+       baseline from a summary index built on a LAGGED window (see 1.4 for the
+       scheduled-search-plus-collect pattern) and score today against it.
+
+    2. Thirty days is a guess. Pick a window that covers the real schedule: if the heavy
+       batch runs monthly, a 30 day baseline sees it roughly once and its stdev is
+       garbage. Consider adding day-of-week to the BY clause, since weekend traffic on
+       most estates is a different curve entirely.
+
+    Chart z as a bar chart. Zero is normal, and the nightly spike sits flat at zero,
+    which is the entire point of the requirement.                                     */

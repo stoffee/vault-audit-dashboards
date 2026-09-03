@@ -1,0 +1,324 @@
+========================================================================================
+ Vault transaction trace, in SPL
+========================================================================================
+ The question these answer: a secret was read. WHICH workload read it, from where,
+ under which policies, and did it succeed? And the reverse: what has one workload
+ been touching?
+
+ The pivot is WORKLOAD IDENTITY, not host and not job name. For Kubernetes clients
+ that is auth.metadata.service_account_name (qualified by cluster and namespace,
+ because service account names repeat across hundreds of clusters). For everything
+ else, CI pipelines, AppRole, LDAP, cert, it is auth.display_name.
+
+ STATUS: verified 2026-09-02 against Splunk 10.4.3. All 14 panels of the companion
+ dashboard return rows and columns, and 9 of the 12 searches here do. The three that
+ return nothing are expected: a scheduled hourly rollup run outside its window, an
+ example search using a placeholder path, and the summary-index form, which needs that
+ rollup to have run at least once.
+
+ Assumes the sample loaded as index=vault_audit sourcetype=vault:audit with KV_MODE=json.
+ Against your own estate the index and sourcetype will differ; whatever ships your audit
+ device into Splunk already names them. Only the first line of each search changes.
+
+ Nested JSON fields are referenced as 'request.path' (single quotes) inside eval/where,
+ and as request.path=... in the base search.
+========================================================================================
+
+
+----------------------------------------------------------------------------------------
+ 4.0  Sanity check: are the identity fields actually populated?
+       RUN THIS FIRST. Every panel below pivots on auth.metadata.* or auth.display_name.
+       If your auth methods do not write metadata (the Kubernetes auth method only
+       populates service_account_name when it is configured to), the workload column
+       silently collapses to display_name for everything and the trace stops being a
+       trace. That failure renders as a normal-looking dashboard.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+| stats count AS events,
+        count('auth.display_name')                    AS have_display_name,
+        count('auth.entity_id')                       AS have_entity_id,
+        count('auth.metadata.service_account_name')   AS have_k8s_sa,
+        count('auth.metadata.kubernetes_cluster')     AS have_k8s_cluster,
+        count('auth.metadata.pipeline_id')            AS have_pipeline,
+        count('request.remote_address')               AS have_source_ip
+| transpose
+
+
+----------------------------------------------------------------------------------------
+ 4.1  The pivot: resolve a workload identity
+       This eval block is the whole requirement. Every other search in this file
+       repeats it. Kept as a macro-shaped snippet on purpose; if you have the rights,
+       save it as a search macro `vault_workload` and call it instead of pasting.
+
+       Cluster and Kubernetes namespace are part of the key because a service account
+       called "sa-api" exists in hundreds of clusters and they are not the same
+       workload. Collapsing them is the difference between an answer and a coincidence.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval workload_kind = if(isnotnull(k8s_sa) AND k8s_sa!="", "kubernetes",
+                       if(isnotnull('auth.metadata.pipeline_id'), "ci-pipeline", "other"))
+
+  /* The namespace is a display concern too, not just a path concern. Root-namespace
+     events carry request.namespace.path as "", which renders as a blank column that
+     looks like missing data. Label it. */
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+
+| stats count AS ops,
+        dc(eval(coalesce('request.namespace.path',"") . 'request.path')) AS distinct_paths,
+        values(workload_kind) AS kind
+        BY workload
+| sort - ops
+| head 50
+
+
+----------------------------------------------------------------------------------------
+ 4.2  TRACE FORWARD: who reads this secret?
+       Start from a path, end at a list of workloads. This is the answer to "we are
+       about to rotate this credential, what breaks".
+
+       The path filter is NOT optional at scale. Grouping by secret across a whole
+       estate is a group-by over hundreds of thousands of keys. Always arrive here
+       from a known path, a prefix, or a mount.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response request.mount_type=kv request.operation=read
+    request.path="*/data/app-a/*"
+
+  /* Root namespace is an EMPTY STRING. A bare concat yields null there and silently
+     drops every root-namespace event, roughly 40% of a typical estate, with no error.
+     coalesce is mandatory, not defensive. */
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+
+| stats count AS reads,
+        min(_time) AS first_seen,
+        max(_time) AS last_seen,
+        dc('request.remote_address') AS source_ips,
+        values('auth.entity_id') AS entity_ids,
+        values('auth.policies{}') AS policies
+        BY secret workload
+| eval first_seen = strftime(first_seen,"%F %T"),
+       last_seen  = strftime(last_seen,"%F %T"),
+       policies   = mvjoin(policies, ", ")
+| sort - reads
+
+
+----------------------------------------------------------------------------------------
+ 4.3  TRACE BACKWARD: what does this workload touch?
+       Start from a workload, end at a list of secrets. This is the answer to "this
+       service account leaked, what was it able to reach and what did it actually use".
+
+       Note the operation is not filtered. A workload that writes to a path it should
+       only read is exactly the thing worth seeing here.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response request.mount_class=secret
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| search workload="eks-prod-*/ordering/sa-ordering"
+
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| stats count AS ops,
+        values('request.operation') AS operations,
+        max(_time) AS last_seen
+        BY workload vault_ns secret
+| eval last_seen = strftime(last_seen,"%F %T"),
+       operations = mvjoin(operations, ",")
+| sort - ops
+| head 200
+
+
+----------------------------------------------------------------------------------------
+ 4.4  Recent transactions
+       The raw event list, one row per response, with the identity resolved. This is
+       the panel people actually stare at during an incident.
+
+       No sort command. Splunk already returns events newest first, and a sort over a
+       high-volume window is the expensive way to get the order you already had.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+
+  /* Vault reports a denied or failed operation in more than one place depending on
+     version and mount. Check both rather than picking one and reporting a clean run. */
+# Vault HMACs response.data.error, so it is ALWAYS a hash and never readable.
+# The human-readable reason lives in the TOP-LEVEL error key. Order matters:
+# checking response.data.error first returns a hash and silently never falls through.
+# Confirmed against real Vault audit data 2026-09-02.
+| eval err = coalesce('error', 'response.data.error')
+| eval result = if(isnotnull(err) AND err!="", "ERROR", "ok")
+
+| eval when = strftime(_time, "%F %T")
+| table when workload result request.operation vault_ns secret request.mount_type request.remote_address auth.entity_id
+| rename 'request.operation' AS operation, 'request.mount_type' AS mount,
+         'request.remote_address' AS source_ip, 'auth.entity_id' AS entity_id
+| head 200
+
+
+----------------------------------------------------------------------------------------
+ 4.5  Activity timeline, by workload
+       limit=10 is load bearing. Without it timechart tries to draw one series per
+       workload, and a real estate has hundreds of thousands of them.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| timechart span=1d limit=10 useother=t count BY workload
+
+
+----------------------------------------------------------------------------------------
+ 4.6  Breakdown: operations, and the noisiest workloads
+       Two cheap distributions. `top` is bounded by definition, which is the point;
+       neither of these grows with path or workload cardinality.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response request.mount_class=secret
+| top limit=10 request.operation
+
+index=vault_audit sourcetype=vault:audit type=response request.mount_class=secret
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| top limit=10 workload
+
+
+----------------------------------------------------------------------------------------
+ 4.7  Failed and denied operations, by workload
+       A permission denial is a misconfigured workload or a probe. Either way it is
+       the row worth reading first, and it is invisible in a total-ops count.
+
+       Use auth.policy_results.allowed as the DETECTOR and the error text as the
+       REASON. They do different jobs and you want both:
+         auth.policy_results.allowed  boolean, set once policy evaluation runs.
+         error                        human-readable, e.g. "permission denied".
+
+       Neither is sufficient alone, and this is measured, not assumed. On a real
+       dev-Vault capture of 348 responses: the boolean flagged 30 denials, but 46
+       events carried error text. The extra 16 were auth failures (invalid token,
+       and denials raised before policy evaluation) which have NO policy_results
+       at all. Testing only the boolean misses them; testing only the string
+       cannot be aggregated. The panel therefore ORs the two.
+       Do NOT detect a denial by testing whether an error string is non-empty.
+       That misses any failure Vault records without populating the field, and it
+       cannot be aggregated. The boolean can.
+
+       An audit stream with no failures in the window returns nothing here. Empty
+       means clean, not broken. Confirm that by checking the denial counter on a
+       window you KNOW contains a failure, rather than inferring health from a
+       blank panel.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit type=response
+# Vault HMACs response.data.error, so it is ALWAYS a hash and never readable.
+# The human-readable reason lives in the TOP-LEVEL error key. Order matters:
+# checking response.data.error first returns a hash and silently never falls through.
+# Confirmed against real Vault audit data 2026-09-02.
+| eval err = coalesce('error', 'response.data.error')
+| eval denied = if('auth.policy_results.allowed'=="false", 1, 0)
+| where denied=1 OR (isnotnull(err) AND err!="")
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| stats count AS failures, values(err) AS errors, max(_time) AS last_seen
+        BY workload 'request.operation' secret
+| eval last_seen = strftime(last_seen,"%F %T")
+| sort - failures
+| head 100
+
+
+----------------------------------------------------------------------------------------
+ 4.8  Blast radius: secrets read by more than one workload
+       A shared credential is the reason a rotation turns into an outage. This finds
+       them without ever listing every path, because the `where` prunes before the
+       table is materialised for display.
+
+       Still a group-by over paths, so scope it with a mount or namespace filter on a
+       large estate, or run it as a scheduled search rather than a live panel.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response request.mount_type=kv request.operation=read request.path="*/data/*"
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| stats dc(workload) AS consumers, values(workload) AS who, count AS reads BY secret
+| where consumers > 1
+| eval who = mvjoin(who, ", ")
+| sort - consumers
+| head 100
+
+
+----------------------------------------------------------------------------------------
+ 4.9  PRODUCTION SHAPE: scheduled search into a summary index
+       4.2 and 4.8 rescan the raw audit window. At tens to hundreds of millions of
+       audit events per day that is not a live panel, it is a batch job.
+
+       Fold hourly into a small (workload, secret) edge list, then point the dashboard
+       at the summary. The edge list is bounded by how many workloads actually read
+       how many secrets, which is far smaller than paths times identities.
+
+       Schedule: hourly.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response request.mount_class=secret
+    earliest=-1h@h latest=@h
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| stats count AS ops, max(_time) AS last_seen,
+        values('request.operation') AS operations
+        BY workload secret
+| collect index=vault_summary sourcetype=vault:access:edges
+
+/*  ...and the dashboard search that reads it back. It re-folds, because each hourly
+    run appends one row per (workload, secret) pair touched in that hour.            */
+index=vault_summary sourcetype=vault:access:edges
+| stats sum(ops) AS ops, max(last_seen) AS last_seen, values(operations) AS operations
+        BY workload secret
+| eval last_seen = strftime(last_seen,"%F %T")
+
+
+========================================================================================
+ Known soft spots in this file
+========================================================================================
+ - auth.policies{} is an array. The {} suffix is how Splunk's JSON extraction names a
+   multivalue field, but the exact name depends on how the sourcetype was configured.
+   If 4.2 returns an empty policies column, check the field name in the field picker
+   before assuming the search is broken.
+ - SETTLED 2026-09-02 against real Vault audit data: the readable denial reason is
+   the TOP-LEVEL error key ("1 error occurred: * permission denied").
+   response.data.error also exists but is HMAC'd, so it is never displayable.
+   Coalesce order is therefore error first, and that order is load-bearing.her leaves everything in "other",
+   which is honest but not useful. 4.0 is how you find that out.
+========================================================================================

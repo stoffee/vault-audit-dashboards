@@ -1,0 +1,6 @@
+<nav search_view="search" color="#65A637">
+  <view name="vault_secret_hygiene" default="true"/>
+  <view name="vault_transaction_trace"/>
+  <view name="audit_volume_attribution"/>
+  <view name="search"/>
+</nav>

@@ -1,0 +1,385 @@
+========================================================================================
+ Audit Volume Attribution, in SPL
+========================================================================================
+ The question these answer: an estate is pushing 100M+ audit events a day into a SIEM,
+ the ingest bill is a line item somebody has to defend, and nobody can say WHAT is
+ producing the volume. Without that, "filter the audit log" is a guess, and a guess
+ about audit data is the kind of thing that gets declined in a compliance review.
+
+ These searches attribute volume to mount, path shape, operation, namespace, and
+ identity, and then rank the high-volume / low-forensic-value patterns so a filtering
+ decision can be argued from evidence instead of vibes.
+
+ STATUS: verified 2026-09-02 against Splunk 10.4.3. 10 of 13 searches return rows,
+ and 11 of the 12 companion dashboard panels do. The exceptions are two scheduled
+ rollups run outside their window, and the classifier-gap panel, which is correctly
+ empty when the classifier covers every path present.
+
+ Assumes the sample loaded as index=vault_audit sourcetype=vault:audit with KV_MODE=json.
+ Against your own estate the index and sourcetype will differ; only the first line of
+ each search changes.
+
+ Nested JSON fields are referenced as 'request.path' (single quotes) inside eval/where,
+ and as request.path=... in the base search.
+
+----------------------------------------------------------------------------------------
+ TWO RULES THAT DECIDE WHETHER THE NUMBERS ARE RIGHT
+----------------------------------------------------------------------------------------
+
+ 1. COUNT BOTH type="request" AND type="response".
+    Vault emits one audit entry when a request arrives and a second when it is answered.
+    Both are written to the device, both are shipped, both are billed. Every search in
+    this file therefore places NO type= filter and counts both, because the question is
+    ingest cost, not "what happened".
+    This is the opposite of stale-secrets.spl, which folds type=response only: there
+    the question is "did this secret get read", and counting the request too would
+    double every read. Different question, different rule. Do not copy one into the other.
+
+    Where a search does need to separate them, it splits BY 'type' rather than filtering.
+
+    ⚠️ CHECK THIS FIRST: run the request/response split panel before anything else. A
+    real audit device emits both, roughly 1:1. If you see only one type, your shipper is
+    dropping half the stream, and every volume number here is half the truth while
+    looking entirely plausible.
+
+ 2. THE ROOT NAMESPACE IS AN EMPTY STRING.
+    Any fully-qualified path MUST be built as:
+        | eval secret = coalesce('request.namespace.path',"") . 'request.path'
+    A bare concatenation of a null/absent namespace yields null and SILENTLY DROPS every
+    root-namespace event, with no error and no empty panel to warn you. Measured on one
+    real cluster that was 17% of events, and on a test corpus 41%. This bug has shipped
+    for real.
+    The same applies to grouping BY namespace: relabel "" to a visible token first, or
+    the largest namespace in most estates renders as a blank row.
+
+----------------------------------------------------------------------------------------
+ A NOTE ON SCALE, AND ON tstats
+----------------------------------------------------------------------------------------
+ Never write a volume search that groups BY the secret path. A large estate has hundreds
+ of thousands of KV v2 paths; `stats count BY secret` builds a result set the same size
+ and answers a question nobody asked. Volume attribution is a question about CLASSES of
+ traffic, so every search here groups by mount, mount_type, operation, namespace,
+ identity, or a derived path PATTERN, all of which are low cardinality by construction.
+
+ Where tstats genuinely helps: `| tstats count` reads the tsidx metadata directly and
+ never touches the raw events, so the total-volume baseline and the per-day trend of
+ TOTAL ingest are effectively free at any retention depth. See V0 and V1a.
+
+ Where tstats does NOT help, and why: `request.mount_type` and friends are search-time
+ JSON extractions, not indexed fields. tstats can only group by indexed fields
+ (index, sourcetype, source, host, _time) or by fields in an accelerated data model.
+ So every attribution search below is a normal search. If you run this daily on a large
+ estate, the right move is the same one as 1.4: a scheduled search that folds into a
+ summary index, and a dashboard that reads the summary. See V8.
+========================================================================================
+
+
+----------------------------------------------------------------------------------------
+ V0  Sanity check: total ingest, and the request/response split
+     RUN THIS FIRST. A real audit device emits request and response entries roughly
+     1:1. If request_events is 0, your audit device or forwarder is dropping request
+     entries, every volume number here is half of the real one, and your SIEM bill
+     will disagree with this dashboard.
+----------------------------------------------------------------------------------------
+| tstats count AS total_events WHERE index=vault_audit sourcetype=vault:audit
+
+ ...and the split, which needs the raw events because 'type' is not indexed:
+index=vault_audit sourcetype=vault:audit
+| stats count BY type
+| eventstats sum(count) AS total
+| eval pct = round(count * 100 / total, 1)
+
+
+----------------------------------------------------------------------------------------
+ V1  PANEL 1: Events per day, split by mount type
+     The shape of the trend matters more than the height. A flat line is a steady-state
+     platform; a step change is a workload that onboarded; a daily spike is a batch job,
+     and a batch job is the most commonly filterable thing in the whole estate.
+     Both request and response counted (see rule 1).
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| timechart span=1d count BY request.mount_type useother=t limit=10
+
+ V1a  Total ingest per day only, at any retention depth, for free.
+      Use this one when the window is long enough that V1 gets slow. It cannot break
+      down by mount type (see the tstats note above), but it will render 18 months
+      instantly, and it is the correct denominator to reconcile against the SIEM's own
+      licence-usage numbers.
+| tstats count WHERE index=vault_audit sourcetype=vault:audit BY _time span=1d
+
+
+----------------------------------------------------------------------------------------
+ V2  PANEL 2: Top mounts by volume, with percent of total
+     mount_point is the unit an operator can actually act on: audit device filtering,
+     mount tuning, and the conversation with the team that owns it all happen per mount.
+     Cardinality is bounded by the number of mounts, not by paths.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| eval mount = coalesce('request.namespace.path',"") . coalesce('request.mount_point',"(none)")
+| stats count AS events,
+        dc(auth.display_name) AS distinct_identities,
+        values(request.mount_type) AS mount_type
+        BY mount
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| eval events_per_day = round(events / 30, 0)
+| sort - events
+| head 25
+| table mount mount_type events pct_of_total events_per_day distinct_identities
+
+/*  events_per_day above assumes a 30-day window. If the dashboard time picker says
+    something else, that column lies. It is kept because "per day" is the unit ingest
+    is priced in and an operator reads it faster than a raw total; change the divisor
+    if you change the default window.                                                  */
+
+
+----------------------------------------------------------------------------------------
+ V3  PANEL 3: Top operations by volume
+     Split by 'type' as well, because a request/response ratio that is not ~1.0 for a
+     given operation is worth a second look: it usually means errors, or an operation
+     that fans out.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| eval op = coalesce('request.operation',"(none)"),
+       mt = coalesce('request.mount_type',"(none)")
+| stats count AS events BY op mt type
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| sort - events
+| head 30
+
+
+----------------------------------------------------------------------------------------
+ V4  PANEL 4: Volume by namespace
+     Note the relabel. Root is an empty string and would otherwise render as a blank
+     row, which reads as a broken panel rather than as the largest tenant.
+     This is the panel that answers "whose budget is this".
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| eval ns = coalesce('request.namespace.path',"")
+| eval ns = if(ns == "", "root (empty string)", ns)
+| stats count AS events,
+        dc(request.mount_point) AS mounts,
+        dc(auth.display_name) AS identities
+        BY ns
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| sort - events
+
+
+----------------------------------------------------------------------------------------
+ V5  PANEL 5: Top talkers, the identities generating the most events
+     Volume attribution stops being abstract at this panel: every row is a workload with
+     an owner you can go and talk to. A single service account at 20% of total ingest is
+     a conversation, not a filter rule.
+
+     display_name is the human-legible one; service_account_name is the Kubernetes
+     workload. Both are low cardinality relative to paths. entity_id would be more
+     precise and much less readable, so it is not the grouping key here.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| eval who    = coalesce('auth.display_name',"(unauthenticated / no auth block)"),
+       k8s_sa = coalesce('auth.metadata.service_account_name',"-")
+| stats count AS events,
+        dc(request.mount_point) AS mounts,
+        values(request.mount_type) AS mount_types,
+        earliest(_time) AS first_seen,
+        latest(_time) AS last_seen
+        BY who k8s_sa
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| eval first_seen = strftime(first_seen,"%F %T"), last_seen = strftime(last_seen,"%F %T")
+| sort - events
+| head 25
+| table who k8s_sa events pct_of_total mounts mount_types first_seen last_seen
+
+/*  A "(unauthenticated / no auth block)" row is not an anomaly. Unauthenticated
+    endpoints (sys/health, sys/seal-status, login attempts that failed before an
+    identity existed) legitimately have no auth block. If that row is LARGE, it is
+    usually a load balancer health check, which is V6's best filter candidate.       */
+
+
+----------------------------------------------------------------------------------------
+ V6  PANEL 6, THE MONEY PANEL: filter candidates
+     High volume plus low forensic value. This is the panel that turns "our audit logs
+     are too big" into "these three path patterns are 60% of your volume, and here is
+     what you give up by dropping each one".
+
+     Classification is by PATH PATTERN, not by path. That is deliberate and it is the
+     only reason this is safe at 345k-path scale: the case statement collapses an
+     unbounded path space into ~a dozen buckets before any stats command runs.
+
+     Forensic value is a judgement, not a measurement. The ratings below are defensible
+     defaults, not a recommendation to filter. Read the caveats before acting.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| eval p  = coalesce('request.path',""),
+       mt = coalesce('request.mount_type',""),
+       op = coalesce('request.operation',"")
+
+| eval pattern = case(
+      mt=="transit" AND match(p,"/(encrypt|decrypt)/"),      "transit encrypt/decrypt (data-plane crypto)",
+      mt=="transit" AND match(p,"/(sign|verify|hmac|rewrap)/"), "transit sign/verify/hmac",
+      mt=="transit",                                          "transit other",
+      match(p,"^auth/token/lookup-self$"),                    "token lookup-self",
+      match(p,"^auth/token/renew-self$"),                     "token renew-self",
+      match(p,"^auth/token/(lookup|renew|create)"),           "token lookup/renew/create",
+      match(p,"^sys/(health|seal-status|leader|ha-status)$"), "sys health / status probes",
+      match(p,"^sys/metrics"),                                "sys metrics scrape",
+      match(p,"^sys/internal/ui/"),                           "sys internal UI (browser chatter)",
+      match(p,"^identity/(lookup|oidc)/"),                    "identity lookup",
+      match(p,"^cubbyhole/"),                                 "cubbyhole",
+      match(p,"/metadata/") OR match(p,"/subkeys/"),          "kv metadata / subkeys (browsing)",
+      op=="list",                                             "list operations (browsing)",
+      match(p,"/login$"),                                     "auth login",
+      match(p,"/data/"),                                      "kv secret data access",
+      true(),                                                 "everything else")
+
+ forensic_value is the question "if this line were missing from the SIEM, would an
+ investigation notice?". Anything that mutates state or grants access is HIGH and is
+ not a filter candidate at any volume.
+| eval forensic_value = case(
+      pattern=="transit encrypt/decrypt (data-plane crypto)", "LOW: high-rate data-plane crypto, key usage is provable from metrics",
+      pattern=="transit sign/verify/hmac",                    "LOW-MED: same shape, but signing is sometimes in audit scope",
+      pattern=="token lookup-self",                           "LOW: a token asking about itself grants nothing",
+      pattern=="token renew-self",                            "LOW: renewal of an already-issued token",
+      pattern=="sys health / status probes",                  "LOW: load balancer and orchestrator probes",
+      pattern=="sys metrics scrape",                          "LOW: monitoring scrape",
+      pattern=="sys internal UI (browser chatter)",           "LOW: UI page loads, not access",
+      pattern=="kv metadata / subkeys (browsing)",            "MED: browsing, not use, but shows intent",
+      pattern=="list operations (browsing)",                  "MED: enumeration is a recon signal, keep if you hunt",
+      pattern=="identity lookup",                             "MED",
+      pattern=="cubbyhole",                                   "MED",
+      pattern=="auth login",                                  "HIGH: authentication events, do not filter",
+      pattern=="kv secret data access",                       "HIGH: this is the access record, do not filter",
+      true(),                                                 "UNKNOWN: classify before filtering")
+
+| stats count AS events,
+        dc(auth.display_name) AS identities,
+        dc(request.mount_point) AS mounts
+        BY pattern forensic_value
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+
+ Running total, so the table answers "how much do the top N patterns buy me" directly.
+| sort - events
+| streamstats sum(pct_of_total) AS cumulative_pct
+| eval cumulative_pct = round(cumulative_pct, 2)
+| eval candidate = if(match(forensic_value,"^LOW") AND pct_of_total >= 1,
+                      "FILTER CANDIDATE", "keep")
+| table pattern forensic_value events pct_of_total cumulative_pct candidate identities mounts
+
+/*  HOW TO READ THIS, AND THE CAVEATS THAT GO WITH IT.
+
+    The headline is the sum of pct_of_total across the FILTER CANDIDATE rows. In estates
+    that run transit at data-plane rates, encrypt/decrypt alone is routinely the single
+    largest contributor, because every application call to encrypt a field emits a
+    request and a response entry regardless of how small the payload is.
+
+    Before anything is filtered:
+
+    - Filtering happens at the audit device or in the log pipeline, NOT in Splunk.
+      Excluding events at search time saves nothing; you are already paying to index
+      them. The saving is upstream.
+    - Vault audit device filtering is a supported feature on Enterprise. If you are on
+      Community, the filter belongs in the shipper.
+    - ⚠️ A blocked audit device blocks Vault. Audit is fail-closed by design. Never
+      test a filter change on the only audit device on a production cluster.
+    - ⚠️ Get the retention decision reviewed by whoever owns the control. "Low forensic
+      value" is an engineering opinion; the control owner may have a regulatory reason
+      to keep something this table calls noise. Bring the percentages, not a conclusion.
+    - A cheaper middle path than dropping: route the LOW rows to cold/cheap storage
+      instead of the indexed SIEM tier. Same saving, nothing lost.
+    - "everything else" being large means the classifier is stale for your estate.
+      Run /* MEASURED 2026-09-02, and this is why V7 exists.
+   Against a synthetic sample the classifier covered 100% of paths and V7 was
+   empty. Against REAL Vault audit data from two different clusters it was not:
+     kv update/read   60 events   (paths with no /data/ segment, so KV v1 or similar)
+     pki              18
+     ssh               4
+     aws               2
+   The classifier knows KV, auth, transit and sys. A real estate also runs pki,
+   ssh, aws and database engines, and those fall straight through. An empty V7
+   means "this classifier fits THIS data", never "the classifier is complete".
+   Re-run V7 whenever the source changes. */
+
+V7 to see what is in it before you trust any percentage here.               */
+
+
+----------------------------------------------------------------------------------------
+ V7  What is inside "everything else"
+     Companion to V6. If the unclassified bucket is a meaningful share of volume, the
+     case statement is missing a pattern your estate actually runs.
+
+     This groups by mount_type + operation, NOT by path, so it stays bounded. To see
+     actual paths, add a mount filter first and keep the window short; a bare
+     `BY request.path` over a large estate is the one thing this file tells you not
+     to do.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| eval p = coalesce('request.path',"")
+| where NOT (match(p,"^(auth|sys|identity|cubbyhole)/") OR match(p,"/(data|metadata|subkeys|encrypt|decrypt|login)/") OR match(p,"/login$"))
+| stats count AS events BY request.mount_type request.operation request.mount_class
+| sort - events
+| head 30
+
+
+----------------------------------------------------------------------------------------
+ V8  PRODUCTION SHAPE: fold volume into a summary index
+     Every search above rescans the window. At 100M+ events/day that is exactly the cost
+     problem the dashboard exists to solve, so do not solve it by re-reading everything
+     every refresh.
+
+     Schedule hourly. The summary rows are bounded by
+     (mounts x operations x namespaces x patterns), which is small and does not grow
+     with path count or with event volume. Retain the summary for as long as you want
+     the trend, independent of raw audit retention.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit earliest=-1h@h latest=@h
+| eval ns = coalesce('request.namespace.path',""),
+       p  = coalesce('request.path',""),
+       mt = coalesce('request.mount_type',"(none)")
+| eval ns = if(ns == "", "root", ns)
+| eval pattern = case(
+      mt=="transit" AND match(p,"/(encrypt|decrypt)/"),      "transit-crypto",
+      match(p,"^auth/token/(lookup|renew)-self$"),           "token-self",
+      match(p,"^sys/(health|seal-status|leader|ha-status)$"), "sys-probe",
+      match(p,"/metadata/") OR match(p,"/subkeys/"),          "kv-browse",
+      match(p,"/login$"),                                     "auth-login",
+      match(p,"/data/"),                                      "kv-data",
+      true(),                                                 "other")
+| stats count AS events BY ns mt pattern request.operation type
+| collect index=vault_summary sourcetype=vault:audit:volume
+
+ ...and the dashboard search that reads it back. Cheap regardless of history depth.
+index=vault_summary sourcetype=vault:audit:volume
+| stats sum(events) AS events BY pattern
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| sort - events
+
+
+----------------------------------------------------------------------------------------
+ V9  Reconciliation: does this dashboard agree with the ingest bill?
+     Run this before quoting a percentage at anyone. Bytes, not events, is what a SIEM
+     charges for, and a transit encrypt entry is much smaller than a KV read entry with
+     a response body. A pattern that is 40% of EVENTS may be 15% of BYTES, and the
+     saving that gets argued about is the byte number.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+| eval bytes = len(_raw)
+| eval mt = coalesce('request.mount_type',"(none)")
+| stats count AS events, sum(bytes) AS bytes, avg(bytes) AS avg_bytes BY mt type
+| eventstats sum(bytes) AS total_bytes, sum(events) AS total_events
+| eval pct_of_events = round(events * 100 / total_events, 2),
+       pct_of_bytes  = round(bytes  * 100 / total_bytes,  2),
+       avg_bytes     = round(avg_bytes, 0),
+       gb            = round(bytes / 1024 / 1024 / 1024, 3)
+| sort - bytes
+| table mt type events pct_of_events gb pct_of_bytes avg_bytes
+
+/*  len(_raw) is the on-disk raw size before Splunk's own overhead, so this is an
+    approximation of licence volume, not an invoice. Compare it against the SIEM's
+    native usage reporting rather than replacing it. The point of the panel is the
+    RATIO between pct_of_events and pct_of_bytes, which is where a filtering argument
+    quietly falls apart.                                                             */

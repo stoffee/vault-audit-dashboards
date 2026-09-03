@@ -1,0 +1,457 @@
+<form version="1.1" theme="light">
+  <label>Vault Transaction Trace: Who Read This Secret</label>
+  <description>Correlates a secret access back to the workload that made it: a Kubernetes service account, a CI pipeline, or a named auth identity. Metadata only; audit logs carry HMAC'd values, so no secret value can be rendered here.</description>
+
+  <!-- Every panel repeats the same workload-resolving eval block rather than sharing a
+       base search. A base search post-processes from a capped result set, which returns
+       a smaller number with no error, and a silently low count is worse than a slow one.
+       If you can save search macros, replace the repeated block with one macro call. -->
+
+  <fieldset submitButton="false" autoRun="true">
+    <input type="time" token="tr" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-7d@d</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="text" token="workload" searchWhenChanged="true">
+      <label>Workload (cluster/k8s-ns/service-account, or display name)</label>
+      <default>*</default>
+    </input>
+    <input type="dropdown" token="nsfilter" searchWhenChanged="true">
+      <label>Vault namespace</label>
+      <choice value="*">All namespaces</choice>
+      <choice value="root">root</choice>
+      <choice value="pci/">pci (regulated scope)</choice>
+      <choice value="platform/">platform</choice>
+      <choice value="apps/">apps</choice>
+      <choice value="data/">data</choice>
+      <default>*</default>
+    </input>
+    <input type="text" token="pathfilter" searchWhenChanged="true">
+      <label>Secret path (namespace-relative, wildcards allowed)</label>
+      <default>*</default>
+    </input>
+  </fieldset>
+
+  <row>
+    <panel>
+      <html>
+        <div style="padding:8px 12px;background:#fff4e5;border-left:4px solid #f5a623;font-family:sans-serif;">
+          <b>Metadata only.</b> The Vault audit device HMACs every secret value before
+          writing it, so no panel here can render a secret: there is no secret value in
+          the input. Community-built asset, not a HashiCorp product feature.
+        </div>
+      </html>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <html>
+        <div style="padding:8px 12px;background:#eef4fa;border-left:4px solid #006d9c;font-family:sans-serif;">
+          <b>Workload identity varies by auth method.</b> Kubernetes logins populate
+          <code>auth.metadata.service_account_name</code>, so a row reads as
+          <code>cluster/namespace/service-account</code>. Other auth methods do not, and fall
+          back to <code>auth.display_name</code>. If every row here collapses to one value,
+          your auth method is not writing identity metadata; that is a mount configuration
+          question, not a dashboard fault.
+        </div>
+      </html>
+    </panel>
+  </row>
+
+  <!-- ============================ the last transaction ============================ -->
+  <row>
+    <panel>
+      <title>WHO</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| stats count AS ops BY workload
+| sort - ops
+| head 1
+| table workload
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="useColors">0</option>
+        <option name="underLabel">busiest workload identity in range</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>WHAT</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| stats count AS ops BY request.operation
+| sort - ops
+| head 1
+| table request.operation
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="useColors">0</option>
+        <option name="underLabel">most frequent operation</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>RESULT</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| eval err = coalesce('error', 'response.data.error')
+| stats count AS ops, count(err) AS failures
+| eval result = if(failures &gt; 0, failures . " FAILED", "all ok")
+| table result
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="useColors">0</option>
+        <option name="underLabel">denials and errors in range</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>TOTAL OPS</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| stats count AS total_ops
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="useColors">0</option>
+        <option name="underLabel">audited responses matching the filters</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- The four singles below describe the MOST RECENT matching transaction. They are
+       "what just happened", not a summary. Narrow the filters until one row means
+       something, otherwise this row is just the newest event in the estate. -->
+  <row>
+    <panel>
+      <title>SECRET PATH (most recent matching transaction)</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| head 1
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| table secret
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">none</option>
+        <option name="underLabel">fully qualified: namespace path plus request path</option>
+      </single>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>IDENTITY</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| head 1
+| table workload
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">none</option>
+        <option name="underLabel">service account if Kubernetes, otherwise display name</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>SOURCE IP</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| head 1
+| table request.remote_address
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">none</option>
+        <option name="underLabel">pod or runner IP, often ephemeral</option>
+      </single>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>POLICIES</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| head 1
+| eval policies = mvjoin('auth.policies{}', ", ")
+| table policies
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="colorMode">none</option>
+        <option name="underLabel">policies attached to the token that made the call</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- ============================ recent transactions ============================ -->
+  <row>
+    <panel>
+      <title>Recent transactions. Paths and identities only; no secret values exist in audit logs.</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval err = coalesce('error', 'response.data.error')
+| eval result = if(isnotnull(err) AND err!="", "ERROR", "ok")
+| eval when = strftime(_time, "%Y-%m-%d %H:%M:%S")
+| table when workload result request.operation vault_ns secret request.mount_type request.remote_address auth.entity_id
+| rename 'request.operation' AS operation, 'request.mount_type' AS mount,
+         'request.remote_address' AS source_ip, 'auth.entity_id' AS entity_id
+| head 200
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">none</option>
+        <format type="color" field="result">
+          <colorPalette type="map">{"ERROR":#DC4E41,"ok":#53A051}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============================ activity over time ============================ -->
+  <row>
+    <panel>
+      <title>Activity timeline by workload (top 10, rest folded into OTHER)</title>
+      <chart>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| timechart limit=10 useother=t count BY workload
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisTitleY.text">operations</option>
+        <option name="charting.legend.placement">right</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ============================ breakdown ============================ -->
+  <row>
+    <panel>
+      <title>Operations distribution</title>
+      <chart>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.mount_class=secret
+    request.path="$pathfilter$"
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search vault_ns="$nsfilter$"
+| top limit=10 request.operation
+| fields request.operation count
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">pie</option>
+      </chart>
+    </panel>
+
+    <panel>
+      <title>Busiest workloads</title>
+      <chart>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response request.mount_class=secret
+    request.path="$pathfilter$"
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| top limit=10 workload
+| fields workload count
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">pie</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ============================ the trace itself ============================ -->
+  <!-- Set the path filter to a real path before reading these two. Grouping by secret
+       across a whole estate is a group-by over hundreds of thousands of keys. -->
+  <row>
+    <panel>
+      <title>Who reads this secret. Set the path filter first, then read this as the rotation blast list.</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response
+    request.mount_type=kv request.operation=read request.path="$pathfilter$"
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search workload="$workload$" vault_ns="$nsfilter$"
+| stats count AS reads, min(_time) AS first_seen, max(_time) AS last_seen,
+        dc('request.remote_address') AS source_ips,
+        values('auth.policies{}') AS policies
+        BY secret workload
+| eval first_seen = strftime(first_seen,"%Y-%m-%d %H:%M:%S"),
+       last_seen  = strftime(last_seen,"%Y-%m-%d %H:%M:%S"),
+       policies   = mvjoin(policies, ", ")
+| sort - reads
+| head 100
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">15</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Shared credentials: secrets read by more than one workload. A rotation here is an outage in more than one place.</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit" type=response
+    request.mount_type=kv request.operation=read request.path="$pathfilter$"
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+| eval k8s_sa = 'auth.metadata.service_account_name'
+| eval workload = if(isnotnull(k8s_sa) AND k8s_sa!="",
+        coalesce('auth.metadata.kubernetes_cluster',"no-cluster") . "/" .
+        coalesce('auth.metadata.service_account_namespace',"default") . "/" . k8s_sa,
+        coalesce('auth.display_name',"unknown"))
+| eval vault_ns = if(coalesce('request.namespace.path',"")=="", "root", 'request.namespace.path')
+| search vault_ns="$nsfilter$"
+| stats dc(workload) AS consumers, values(workload) AS who, count AS reads BY secret
+| where consumers &gt; 1
+| eval who = mvjoin(who, ", ")
+| sort - consumers
+| head 100
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">15</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+</form>

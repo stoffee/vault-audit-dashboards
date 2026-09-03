@@ -1,97 +1,131 @@
 # Splunk
 
-The same answer, in the tool most enterprises already run. If your Vault audit device is
-already shipping into Splunk, everything here works over data you have today. No new stack,
-no additional ingest.
+Everything on the Splunk side folds the Vault **audit device** stream. No Python, no
+external process: the fold happens in SPL, inside Splunk.
 
-> ✅ **Verified end to end** on Splunk Cloud **10.5**. Data loaded, searches run, results
-> matched independently computed ground truth **exactly**.
+## What is here
 
----
-
-## Files
-
-| File | What it is |
+| Path | What it is |
 |---|---|
-| `r1-stale-secrets.spl` | The searches. R1.0 sanity, R1.1 fold, R1.2 buckets, R1.3 cleanup list, R1.4 production summary-index form, plus R2/R4/R7/R11 |
-| `dashboard-vault-secret-hygiene.xml` | Simple XML dashboard: SAMPLE DATA banner, 3 headline tiles, and 4 R1/R2/R7/R11 panels, with a namespace filter |
-| `generate-sample.py` | Builds a realistic audit sample + baseline inventory |
-| `samples/` | Generated data; gitignored, regenerate on demand |
+| `splunk-app/vault_audit_hygiene/` | The drop-in app. Install this. |
+| `dashboards/` | The same dashboard XML on its own, if you want to read or adapt it |
+| `searches/` | The SPL on its own, heavily commented, one file per topic |
+
+## Install
 
 ```bash
-python3 generate-sample.py                                    # 10k paths, 105k events, 139 MB
-python3 generate-sample.py --expected                         # print ground truth only
-python3 generate-sample.py --paths 500 --events 4000 \
-    --logins 1000 --out samples/audit.jsonl                   # 7 MB, the verified variant
+cp -r splunk-app/vault_audit_hygiene $SPLUNK_HOME/etc/apps/
+$SPLUNK_HOME/bin/splunk restart
 ```
 
-Deterministic (seed 42), so ground truth is reproducible. **The event schema is real**,
-copied field-for-field from a live Vault audit entry. Paths and identities are synthetic.
-No credential is present; audit logs only ever carry HMAC'd values.
+Copy `default/inputs.conf` to `local/inputs.conf`, point the monitor stanza at wherever
+your shipper writes the audit log, and set `disabled = false`.
 
----
+The searches assume `index=vault_audit sourcetype=vault:audit`. If yours differ, only the
+first line of each search changes.
 
-## Load runbook
+## The one thing you have to supply
 
-### 1. Create the index
+`lookups/vault_secret_inventory.csv`, a one-time list of every secret path with columns
+`secret,namespace,mount`.
 
-Settings → Indexes → **New Index**. Name `vault_audit`, type Events, searchable retention
-long enough to cover your sample (the shipped one spans 540 days).
+This is not optional decoration. **A secret nobody has ever read emits no audit event**,
+so it cannot appear in any search over the audit index. It exists only in that inventory.
+Skip it and the single most important number on the hygiene dashboard is silently missing,
+with no error and no empty panel: the count is simply lower than the truth.
 
-> ⚠️ **Retention trap.** Splunk drops events older than the index freeze period *at ingest*.
-> If retention is shorter than your window, the old buckets come back empty and R1 looks
-> broken when it isn't. Run `R1.0` before trusting any bucket, or shrink the sample with
-> `--window-days N`.
+Build it from a one-time KV metadata walk (`vault secrets list`, then recurse
+`vault kv metadata list` per mount). It goes stale as secrets are created, so re-walk it
+on whatever cadence matches how fast your estate changes.
 
-### 2. Upload the events
+## The dashboards
 
-**Home → "Add data" → Upload.** Select the `.jsonl` → **Next**. On **Set Source Type** →
-**Save As** → `vault:audit`. On **Input Settings** → Index → `vault_audit`. Review → Submit.
+### Vault Secret Hygiene
 
-No `props.conf` is needed: Splunk auto-detects the JSON and parses the nanosecond ISO-8601
-`time` field with no configuration.
+![Vault Secret Hygiene dashboard](../docs/images/splunk-hygiene-overview.jpg)
 
-### 3. Upload the inventory CSV
+Three headline tiles, an age distribution, and a cleanup table. **Rotated but never read**
+is the number to lead with: a rotation job faithfully maintaining credentials that nothing
+consumes.
 
-Settings → Lookups → **Lookup table files** → **New Lookup Table File**. App `search`,
-destination filename `vault_secret_inventory.csv`.
+![Cleanup candidates](../docs/images/splunk-hygiene-cleanup.jpg)
 
-**Do not skip this.** A secret that nobody has ever read leaves no trace in the audit log,
-so no search can find it. This CSV is the only place it exists. Without it the dashboard
-still renders, still looks fine, and quietly leaves out the biggest number on the page: 195
-of the 500 secrets in the small sample have never been read.
+Every row is a credential something is still writing to and nothing has ever read. Paths
+only, because audit logs carry no secret values.
 
-That is it: upload the file. Splunk normally also wants a *lookup definition* pointing at an
-uploaded file, but the searches here reference the CSV by filename, so you don't need one.
+### Vault Transaction Trace
 
-### 4. Run the searches
+![Vault Transaction Trace dashboard](../docs/images/splunk-trace-overview.jpg)
 
-Open `r1-stale-secrets.spl`. **`R1.0` first** (sanity), then `R1.2` (the answer), then `R1.3`
-(the finding). Set the time range to **All time**; the default 24h window hides everything.
+The pivot is workload identity, so `eks-prod-135/ordering/sa-ordering` names a thing you
+can go and fix, rather than an IP that belonged to a pod that no longer exists.
 
-> ⚠️ **`coalesce` on the namespace is required.** Root-namespace events carry
-> `request.namespace.path` as an empty string, and a bare concat yields null, silently
-> dropping every root-namespace secret. Use
-> `eval secret = coalesce('request.namespace.path',"") . 'request.path'`.
+![Recent transactions](../docs/images/splunk-trace-transactions.jpg)
 
-### 5. Import the dashboard
+### Vault Audit Volume Attribution
 
-Dashboards → Create New Dashboard → Classic → Source, then paste
-`dashboard-vault-secret-hygiene.xml`. The root element must keep its `version` attribute
-(`<form version="1.1" …>`) or the validator blocks the save.
+![Audit volume attribution](../docs/images/splunk-volume-overview.jpg)
 
----
+⚠️ Note the **request vs response** pie in that screenshot: a single slice. That is the
+diagnostic working. A real audit device emits both types roughly 1:1, so one slice means
+the shipper feeding it is dropping half the stream, and every volume number is half the
+truth. Check that panel before reading any other number on the page.
 
-## Against your own estate
+## Walkthroughs
 
-1. **Your index and sourcetype names.** Whatever ships your audit device into Splunk already
-   set them. Only the first line of each search changes. Don't guess; ask whoever owns the
-   pipeline.
-2. **Your audit retention depth.** This decides whether R1 answers "18 months" on day one or
-   accumulates toward it.
-3. **The baseline inventory.** A one-time KV metadata walk, which needs a read-only policy.
-4. **`R1.1` vs `R1.4`.** The simple search rescans the whole retention window on every run.
-   At enterprise volume that is not viable; production means the scheduled search into a
-   summary index. Know which one you are showing.
-5. **`R2` / `R4` / `R7` / `R11` are written but never run.** Only the R1 searches have been
-   tested end to end. The rest are straightforward, but treat them as drafts.
+Step by step, with what each result means and where it can mislead you.
+
+| | |
+|---|---|
+| [Who touched this secret?](scenarios/01-who-touched-this-secret.md) | Created, last written, last read, by whom |
+| [Trace a transaction](scenarios/02-trace-a-transaction.md) | A secret out to its consumers, or a workload in to what it touched |
+| [Find stale secrets](scenarios/03-find-stale-secrets.md) | The cleanup list |
+| [Where is my audit volume coming from?](scenarios/04-where-is-my-audit-volume.md) | The filtering argument, with numbers |
+
+## The searches
+
+Each file starts with a numbered sanity check. Run that first: it tells you whether the
+data is shaped the way the rest of the file assumes, before any number can mislead you.
+
+| File | Answers |
+|---|---|
+| `stale-secrets.spl` | Last-read age per secret, the cleanup list, rotation age |
+| `transaction-trace.spl` | Who read this secret, what has this workload touched, denials |
+| `audit-volume-attribution.spl` | What is generating your audit ingest, and what is safe to filter |
+| `secret-count-by-mount.spl` | Secret counts per mount and namespace, without a tree walk |
+| `policy-trending.spl` | Policy operation rate, top policies, policy growth |
+| `nightly-batch-spike.spl` | Time-of-day baseline, so on-call can tell normal from incident |
+| `tls-noise.spl` | TLS handshake flooding, health checker versus scan |
+
+⚠️ **`tls-noise.spl` does not read the audit log.** TLS handshakes fail before Vault ever
+writes an audit entry. It needs Vault *server* logs. Pointed at the audit index it renders
+a permanently empty dashboard with no error, which is the most expensive kind of wrong.
+
+## Two things that will silently give you a wrong answer
+
+**The root namespace has no path.** In a real audit event the root namespace is
+`"namespace": {"id": "root"}` with **no `path` key at all**. So this is required
+everywhere a fully-qualified path is built:
+
+```
+| eval secret = coalesce('request.namespace.path',"") . 'request.path'
+```
+
+A bare `'request.namespace.path' . 'request.path'` yields null for every root-namespace
+event and drops them all. No error. On one real cluster that was 17% of events.
+
+**Single quotes mean different things in different commands.** In `eval` and `where` they
+are a field reference and are required. In `stats ... BY`, `table`, `fields` and `top` they
+are a literal string that matches nothing, so the column silently disappears:
+
+```
+| stats count BY 'request.operation'    <- 0 rows
+| stats count BY request.operation      <- correct
+```
+
+## Scale
+
+Aggregate at ingest, never at query time. A large estate has hundreds of thousands of KV
+secrets, and any search whose cost scales with path cardinality will not survive contact
+with it. The production form of the hygiene fold is a scheduled search writing to a summary
+index with `collect`; each file's last section shows it.

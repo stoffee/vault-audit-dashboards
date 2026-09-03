@@ -1,0 +1,16 @@
+# Dashboards and lookups readable by the auditor role; writable only by admin.
+[]
+access = read : [ admin, power, user, vault_auditor ], write : [ admin ]
+export = system
+
+[views]
+access = read : [ admin, power, user, vault_auditor ], write : [ admin ]
+export = system
+
+[transforms]
+access = read : [ admin, power, user, vault_auditor ], write : [ admin ]
+export = system
+
+[lookups]
+access = read : [ admin, power, user, vault_auditor ], write : [ admin ]
+export = system

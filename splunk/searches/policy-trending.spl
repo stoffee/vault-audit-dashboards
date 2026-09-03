@@ -1,0 +1,237 @@
+========================================================================================
+ policy trending: Policy operation trending
+========================================================================================
+ The question these answer: policy count is in the tens of thousands and grows with
+ every application/environment pair. Is that growth accelerating, which policies are
+ actually referenced, and is anything a leading indicator of policy lookup latency?
+
+ STATUS: verified 2026-09-02. All 7 searches executed against real Vault audit data
+ containing policy-management events, and all returned rows. Note that an audit stream
+ with no policy writes in the window will render these empty, correctly.
+
+ NOTE ON EMPTY RESULTS: the searches that read policy MANAGEMENT paths need somebody to
+ have written a policy inside the search window. Many estates go weeks without one, so
+ empty is common and correct. The searches that read 'auth.policies{}' instead describe
+ policies in force on every login, so those have data whenever there is any traffic. If
+ you want a quick signal that this file works at all, start with those.
+
+ Assumes the sample loaded as index=vault_audit sourcetype=vault:audit with KV_MODE=json.
+
+ Nested JSON fields are referenced as 'request.path' (single quotes) inside eval/where,
+ and as request.path=... in the base search.
+========================================================================================
+
+
+----------------------------------------------------------------------------------------
+ WHICH DATA SOURCE ANSWERS WHICH QUESTION. READ THIS BEFORE BUILDING PANELS.
+----------------------------------------------------------------------------------------
+ There are two different things people mean by "policy metrics" and they live in two
+ different systems.
+
+ AUDIT LOG (this file) answers WHAT HAPPENED:
+   - who created, updated, read, listed or deleted a policy, and when
+   - which policies were attached to the token that made a request
+   - how the distinct policy count is growing over time
+   These are events. Every one of them is a fact about a specific request.
+
+ TELEMETRY (Prometheus / StatsD, NOT this file) answers HOW EXPENSIVE IT WAS:
+   - `vault.policy.get_policy`      policy lookup latency
+   - `vault.policy.set_policy`      policy write latency
+   - `vault.core.fetch_acl_and_token`, `vault.expire.*`, `vault.runtime.*`
+
+ `vault.policy.get_policy` IS NOT IN THE AUDIT LOG. It is a runtime timing metric emitted
+ by Vault's telemetry subsystem, on the interval configured in the `telemetry` stanza. It
+ has no request id, no path, no principal, and no corresponding audit entry. There is no
+ way to derive it, estimate it, or stand in for it using audit events, and a panel that
+ pretends otherwise is worse than a missing panel because it looks answered.
+
+ So: THE LEADING INDICATOR FOR POLICY LOOKUP LATENCY IS A TELEMETRY PANEL, NOT AN AUDIT
+ PANEL. If you want it, enable the telemetry stanza with a Prometheus endpoint and build
+ it in Grafana against `vault_policy_get_policy` (the Prometheus rendering of that metric,
+ exposed as a summary with quantiles). Point the audit panels below at the same dashboard
+ next to it. What audit CAN contribute is the correlate: policy count and policy churn
+ over the same time axis, so you can see whether a latency rise tracks a policy-count
+ rise. That correlation is genuinely useful. It is not a substitute for the metric.
+----------------------------------------------------------------------------------------
+
+
+----------------------------------------------------------------------------------------
+ 6.0  Sanity check: is policy activity being audited at all, and on what paths?
+       RUN THIS FIRST. If it returns nothing, every search below returns nothing, and
+       the reason is upstream: either no policy changes happened in the window, or the
+       audit device is filtered. Do not read an empty result as "no policy churn".
+       ACL policies live at sys/policies/acl/<name>. The pre-1.0 path sys/policy/<name>
+       still works and still shows up in audit logs, so match both.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response
+    (request.path="sys/policies/*" OR request.path="sys/policy*")
+| stats count AS events,
+        dc(request.path) AS distinct_paths,
+        min(_time) AS earliest, max(_time) AS latest
+        BY request.operation
+| eval earliest=strftime(earliest,"%F %T"), latest=strftime(latest,"%F %T")
+
+
+----------------------------------------------------------------------------------------
+ 6.1  Policy operation rate over time, split by operation
+       The trend line. `list` dominating is normal (the UI and most tooling list before
+       they act). A rise in `create`/`update` is real churn.
+
+       Vault writes both create and update as operation=update on these paths, so treat
+       "write" as one class rather than trying to split new from changed. Splitting them
+       needs the create/delete events in 6.5, not the operation verb.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response
+    (request.path="sys/policies/acl/*" OR request.path="sys/policy/*")
+| eval policy_op = case(
+      'request.operation'=="read",   "read",
+      'request.operation'=="list",   "list",
+      'request.operation'=="update", "write",
+      'request.operation'=="delete", "delete",
+      true(),                        'request.operation')
+| timechart span=1d count BY policy_op
+
+
+----------------------------------------------------------------------------------------
+ 6.2  Policy operations by namespace
+       Policies are per-namespace. This is the churn-ownership table: which team is
+       actually generating the growth. Note the root-namespace coalesce; without it
+       root-namespace policy activity silently vanishes into a null group.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response
+    (request.path="sys/policies/acl/*" OR request.path="sys/policy/*")
+| eval namespace = if('request.namespace.path'=="" OR isnull('request.namespace.path'),
+                      "root", 'request.namespace.path')
+| eval qualified_path = coalesce('request.namespace.path',"") . 'request.path'
+| stats count AS ops,
+        dc(qualified_path) AS distinct_policies_touched,
+        count(eval('request.operation'=="update")) AS writes,
+        count(eval('request.operation'=="delete")) AS deletes,
+        max(_time) AS last_op
+        BY namespace
+| eval last_op = strftime(last_op, "%F %T")
+| sort - ops
+
+
+----------------------------------------------------------------------------------------
+ 6.3  Top policies by reference count
+       A different and better measure of "is this policy used" than policy read
+       operations. 'auth.policies{}' is the policy set attached to the token on EVERY
+       request, so this counts how often each policy was actually in force, not how
+       often somebody looked at its definition.
+
+       `default` will be at the top of every estate and is not interesting. The
+       interesting end of this table is the BOTTOM: a policy that exists and is never
+       attached to anything is the policy equivalent of an unread secret. But see the
+       warning under 6.4 before you act on the bottom of this list.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response
+| eval namespace = if('request.namespace.path'=="" OR isnull('request.namespace.path'),
+                      "root", 'request.namespace.path')
+| stats count AS references,
+        dc(auth.display_name) AS distinct_principals,
+        max(_time) AS last_referenced
+        BY auth.policies{} namespace
+| rename auth.policies{} AS policy
+| where policy != "default"
+| eval last_referenced = strftime(last_referenced, "%F %T")
+| sort - references
+| head 100
+
+
+----------------------------------------------------------------------------------------
+ 6.4  Growth in distinct policy count over time
+       The number the capacity conversation needs: is the policy count growing linearly
+       or accelerating? Bucket by day, count distinct policies seen in force that day,
+       then take a running maximum as the floor on estate size.
+
+       THIS IS A FLOOR, NOT A CENSUS, AND THE DIFFERENCE MATTERS. It counts policies
+       SEEN IN USE in the window. A policy that exists but was not attached to any
+       request that day does not appear. Rarely-used and entirely-unused policies are
+       invisible here for exactly the reason unread secrets are invisible in the stale-secret searches: there
+       is no event to find. The true count comes from `vault policy list` per namespace,
+       the same shape of one-time walk the secret-count searches uses for secrets, and the honest version of
+       this panel plots both lines: inventoried policies, and policies seen in use.
+       The gap between them is the dead-policy population.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response
+| rename auth.policies{} AS policy
+| where policy != "default"
+| bin _time span=1d
+| stats dc(policy) AS policies_seen_that_day BY _time
+| streamstats max(policies_seen_that_day) AS policy_count_floor
+| eval day = strftime(_time, "%F")
+| table day policies_seen_that_day policy_count_floor
+
+
+----------------------------------------------------------------------------------------
+ 6.5  Policy creation and deletion churn, net growth per week
+       Where the growth is actually coming from. Requires policy management events in
+       the window; see the caveat at the top of this file.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response
+    (request.path="sys/policies/acl/*" OR request.path="sys/policy/*")
+    (request.operation=update OR request.operation=delete)
+| eval policy = coalesce('request.namespace.path',"") . 'request.path'
+| bin _time span=7d
+| stats count(eval('request.operation'=="update")) AS writes,
+        count(eval('request.operation'=="delete")) AS deletes,
+        dc(policy) AS distinct_policies
+        BY _time
+| eval net_change = writes - deletes
+| eval week = strftime(_time, "%F")
+| table week writes deletes net_change distinct_policies
+
+
+----------------------------------------------------------------------------------------
+ 6.6  Who is writing policies
+       Policy churn at this scale is almost always machine-generated. This says which
+       pipeline or principal is generating it, which is the conversation that actually
+       reduces the count.
+----------------------------------------------------------------------------------------
+index=vault_audit sourcetype=vault:audit
+    type=response
+    (request.path="sys/policies/acl/*" OR request.path="sys/policy/*")
+    request.operation=update
+| eval namespace = if('request.namespace.path'=="" OR isnull('request.namespace.path'),
+                      "root", 'request.namespace.path')
+| eval policy = coalesce('request.namespace.path',"") . 'request.path'
+| stats count AS writes,
+        dc(policy) AS distinct_policies,
+        values(request.remote_address) AS source_ips,
+        max(_time) AS last_write
+        BY auth.display_name namespace
+| eval last_write = strftime(last_write, "%F %T")
+| sort - writes
+
+
+----------------------------------------------------------------------------------------
+ 6.7  NOT ANSWERABLE FROM AUDIT LOGS. Listed so nobody builds a fake version.
+----------------------------------------------------------------------------------------
+ Policy lookup LATENCY              -> telemetry `vault.policy.get_policy`
+ Policy write LATENCY               -> telemetry `vault.policy.set_policy`
+ ACL evaluation cost per request    -> telemetry `vault.core.fetch_acl_and_token`
+ Memory held by the policy store    -> telemetry `vault.runtime.alloc_bytes`, plus
+                                       cluster memory metrics
+ Total policy count INCLUDING
+   policies nobody uses             -> `vault policy list` per namespace, a one-time
+                                       walk in the shape of the secret-count searches's inventory. Not audit.
+ Policy CONTENT, and therefore
+   "which policies are near-identical
+   and could be templated"          -> the policy documents themselves, read from the
+                                       API. Audit records that a policy was written,
+                                       never what was in it.
+
+ That last one is worth saying plainly, because it is the question underneath the
+ fifteen-thousand-policy problem. If policies are being generated one per
+ application/environment pair, the fix is templating, and deciding whether templating
+ is viable requires diffing the policy bodies. No audit search can do that. Pull the
+ policy documents, hash the normalised bodies, and cluster them. Audit trending tells
+ you the problem is growing. It cannot tell you what to collapse.
+----------------------------------------------------------------------------------------

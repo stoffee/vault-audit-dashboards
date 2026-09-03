@@ -116,7 +116,7 @@ Vault audit device ──► (Fluent Bit / file tail) ──┬──► your SI
 ```
 
 The Splunk-native form of the same decision is a **scheduled search feeding a summary
-index** (`collect`). See `R1.4` in `splunk/r1-stale-secrets.spl`. Same idea, Splunk hat.
+index** (`collect`). See `1.4` in `splunk/searches/stale-secrets.spl`. Same idea, Splunk hat.
 
 **Nothing is re-routed.** Fluent Bit tees; your existing SIEM ingest is untouched, at zero
 additional ingest cost.

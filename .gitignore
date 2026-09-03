@@ -1,6 +1,7 @@
-# Generated sample data. Regenerate with splunk/generate-sample.py
-splunk/samples/
+# Local audit data. Never commit an audit log: it names real paths and identities.
 *.jsonl
+*.log
+samples/
 vault_secret_inventory.csv
 
 # Aggregator state
@@ -18,3 +19,4 @@ vault_secret_inventory.csv
 .vscode/
 __pycache__/
 *.pyc
+*.swp

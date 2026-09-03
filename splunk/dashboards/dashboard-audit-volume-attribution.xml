@@ -1,0 +1,409 @@
+<form version="1.1" theme="light">
+  <label>Vault Audit Volume Attribution: where is the ingest coming from</label>
+  <description>Attributes audit-log volume to mounts, paths, operations, namespaces and identities, then ranks high-volume / low-forensic-value patterns as filter candidates. Counts BOTH type=request and type=response, because ingest cost is billed on both. Metadata only; audit values are HMAC'd.</description>
+
+  <fieldset submitButton="false">
+    <input type="time" token="tr" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-30d@d</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="dropdown" token="ns" searchWhenChanged="true">
+      <label>Namespace</label>
+      <choice value="*">All namespaces</choice>
+      <choice value="root">root (empty string)</choice>
+      <choice value="pci/">pci (regulated scope)</choice>
+      <choice value="platform/">platform</choice>
+      <choice value="apps/">apps</choice>
+      <choice value="data/">data</choice>
+      <default>*</default>
+    </input>
+  </fieldset>
+
+  <row>
+    <panel>
+      <html>
+        <div style="padding:8px 12px;background:#fff4e5;border-left:4px solid #f5a623;font-family:sans-serif;">
+          <b>Metadata only.</b> The Vault audit device HMACs every secret value before writing
+          it, so no panel here can render a secret. Community-built asset, not a HashiCorp
+          product feature.
+          <br/>
+          <b>Counting rule:</b> every panel counts <b>both</b> <code>type=request</code> and
+          <code>type=response</code>, because the audit device writes and your SIEM bills for
+          both. Counting responses only halves the number.
+        </div>
+      </html>
+    </panel>
+  </row>
+
+  <!-- ============================ headline numbers ============================ -->
+  <row>
+    <panel>
+      <title>Total audit events</title>
+      <single>
+        <search>
+          <query>
+| tstats count AS events WHERE index=vault_audit sourcetype="vault:audit"
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="numberPrecision">0</option>
+        <option name="underLabel">tstats: reads the index metadata, never the raw events</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>Events per day</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| bin _time span=1d
+| stats count AS events BY _time
+| stats avg(events) AS per_day
+| eval per_day = round(per_day, 0)
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="numberPrecision">0</option>
+        <option name="underLabel">mean over the selected window, request + response</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>Request vs response split</title>
+      <chart>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| stats count BY type
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">pie</option>
+        <option name="charting.legend.placement">right</option>
+      </chart>
+    </panel>
+
+    <panel>
+      <title>Volume in LOW-forensic-value patterns</title>
+      <single>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval p = coalesce('request.path',""), mt = coalesce('request.mount_type',"")
+| eval low = if(
+      (mt=="transit" AND match(p,"/(encrypt|decrypt|sign|verify|hmac|rewrap)/"))
+      OR match(p,"^auth/token/(lookup|renew)-self$")
+      OR match(p,"^sys/(health|seal-status|leader|ha-status)$")
+      OR match(p,"^sys/metrics")
+      OR match(p,"^sys/internal/ui/"), 1, 0)
+| stats sum(low) AS low_events, count AS total_events
+| eval pct = round(low_events * 100 / total_events, 1)
+| fields pct
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="unit">%</option>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xf8be34","0xdc4e41"]</option>
+        <option name="rangeValues">[10,30]</option>
+        <option name="useColors">1</option>
+        <option name="underLabel">share of ingest that an investigation would not miss</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- ============================ 1. trend by mount type ============================ -->
+  <row>
+    <panel>
+      <title>Events per day, by mount type (the shape matters more than the height)</title>
+      <chart>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| timechart span=1d count BY request.mount_type useother=t limit=10
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">area</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleY.text">audit events (request + response)</option>
+        <option name="charting.legend.placement">right</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ============================ 2 + 3. mounts and operations ============================ -->
+  <row>
+    <panel>
+      <title>Top mounts by volume, with percent of total</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval ns_key = coalesce('request.namespace.path',"")
+| eval ns_key = if(ns_key == "", "root", ns_key)
+| where "$ns$" == "*" OR ns_key == "$ns$"
+| eval mount = ns_key . "|" . coalesce('request.mount_point',"(none)")
+| stats count AS events,
+        dc(auth.display_name) AS identities,
+        values(request.mount_type) AS mount_type
+        BY mount
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| sort - events
+| head 20
+| table mount mount_type events pct_of_total identities
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">none</option>
+        <format type="number" field="pct_of_total">
+          <option name="unit">%</option>
+        </format>
+      </table>
+    </panel>
+
+    <panel>
+      <title>Top operations by volume</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval ns_key = coalesce('request.namespace.path',"")
+| eval ns_key = if(ns_key == "", "root", ns_key)
+| where "$ns$" == "*" OR ns_key == "$ns$"
+| eval operation = coalesce('request.operation',"(none)"),
+       mount_type = coalesce('request.mount_type',"(none)")
+| stats count AS events BY operation mount_type
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| sort - events
+| head 20
+| table operation mount_type events pct_of_total
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">none</option>
+        <format type="number" field="pct_of_total">
+          <option name="unit">%</option>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============================ 4 + 5. namespace and top talkers ============================ -->
+  <row>
+    <panel>
+      <title>Volume by namespace (whose budget is this?)</title>
+      <chart>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval ns = coalesce('request.namespace.path',"")
+| eval ns = if(ns == "", "root (empty string)", ns)
+| stats count AS events BY ns
+| sort - events
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="charting.axisTitleX.text">audit events</option>
+        <option name="charting.fieldColors">{"events":0x006d9c}</option>
+      </chart>
+    </panel>
+
+    <panel>
+      <title>Top talkers: identities generating the most events</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval ns_key = coalesce('request.namespace.path',"")
+| eval ns_key = if(ns_key == "", "root", ns_key)
+| where "$ns$" == "*" OR ns_key == "$ns$"
+| eval who    = coalesce('auth.display_name',"(unauthenticated / no auth block)"),
+       k8s_sa = coalesce('auth.metadata.service_account_name',"-")
+| stats count AS events,
+        dc(request.mount_point) AS mounts,
+        values(request.mount_type) AS mount_types
+        BY who k8s_sa
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| sort - events
+| head 20
+| table who k8s_sa events pct_of_total mounts mount_types
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">none</option>
+        <format type="number" field="pct_of_total">
+          <option name="unit">%</option>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============================ 6. the money panel ============================ -->
+  <row>
+    <panel>
+      <title>Filter candidates: high volume, low forensic value. Classified by path PATTERN, never by path.</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval ns_key = coalesce('request.namespace.path',"")
+| eval ns_key = if(ns_key == "", "root", ns_key)
+| where "$ns$" == "*" OR ns_key == "$ns$"
+| eval p  = coalesce('request.path',""),
+       mt = coalesce('request.mount_type',""),
+       op = coalesce('request.operation',"")
+| eval pattern = case(
+      mt=="transit" AND match(p,"/(encrypt|decrypt)/"),          "transit encrypt/decrypt (data-plane crypto)",
+      mt=="transit" AND match(p,"/(sign|verify|hmac|rewrap)/"),  "transit sign/verify/hmac",
+      mt=="transit",                                             "transit other",
+      match(p,"^auth/token/lookup-self$"),                       "token lookup-self",
+      match(p,"^auth/token/renew-self$"),                        "token renew-self",
+      match(p,"^auth/token/(lookup|renew|create)"),              "token lookup/renew/create",
+      match(p,"^sys/(health|seal-status|leader|ha-status)$"),    "sys health / status probes",
+      match(p,"^sys/metrics"),                                   "sys metrics scrape",
+      match(p,"^sys/internal/ui/"),                              "sys internal UI (browser chatter)",
+      match(p,"^identity/(lookup|oidc)/"),                       "identity lookup",
+      match(p,"^cubbyhole/"),                                    "cubbyhole",
+      match(p,"/metadata/") OR match(p,"/subkeys/"),             "kv metadata / subkeys (browsing)",
+      op=="list",                                                "list operations (browsing)",
+      match(p,"/login$"),                                        "auth login",
+      match(p,"/data/"),                                         "kv secret data access",
+      true(),                                                    "everything else")
+| eval forensic_value = case(
+      pattern=="transit encrypt/decrypt (data-plane crypto)", "LOW: data-plane crypto, key usage provable from metrics",
+      pattern=="transit sign/verify/hmac",                    "LOW-MED: signing is sometimes in audit scope",
+      pattern=="token lookup-self",                           "LOW: a token asking about itself grants nothing",
+      pattern=="token renew-self",                            "LOW: renewal of an already-issued token",
+      pattern=="sys health / status probes",                  "LOW: load balancer and orchestrator probes",
+      pattern=="sys metrics scrape",                           "LOW: monitoring scrape",
+      pattern=="sys internal UI (browser chatter)",            "LOW: UI page loads, not access",
+      pattern=="kv metadata / subkeys (browsing)",             "MED: browsing, not use, but shows intent",
+      pattern=="list operations (browsing)",                   "MED: enumeration is a recon signal",
+      pattern=="identity lookup",                              "MED",
+      pattern=="cubbyhole",                                    "MED",
+      pattern=="auth login",                                   "HIGH: authentication events, do not filter",
+      pattern=="kv secret data access",                        "HIGH: this is the access record, do not filter",
+      true(),                                                  "UNKNOWN: classify before filtering")
+| stats count AS events, dc(auth.display_name) AS identities, dc(request.mount_point) AS mounts
+        BY pattern forensic_value
+| eventstats sum(events) AS total_events
+| eval pct_of_total = round(events * 100 / total_events, 2)
+| sort - events
+| streamstats sum(pct_of_total) AS cumulative_pct
+| eval cumulative_pct = round(cumulative_pct, 2)
+| eval verdict = if(match(forensic_value,"^LOW") AND pct_of_total &gt;= 1, "FILTER CANDIDATE", "keep")
+| table pattern forensic_value events pct_of_total cumulative_pct verdict identities mounts
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">none</option>
+        <format type="number" field="pct_of_total">
+          <option name="unit">%</option>
+        </format>
+        <format type="number" field="cumulative_pct">
+          <option name="unit">%</option>
+        </format>
+        <format type="color" field="verdict">
+          <colorPalette type="map">{"FILTER CANDIDATE":#DC4E41}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <html>
+        <div style="padding:8px 12px;background:#eef6fb;border-left:4px solid #006d9c;font-family:sans-serif;">
+          <b>Before anything gets filtered.</b>
+          Filtering happens at the <b>audit device or in the log pipeline</b>, never at search
+          time; the events above are already indexed and already paid for, so a search-time
+          exclusion saves nothing. <b>A blocked audit device blocks Vault</b> (audit is
+          fail-closed by design), so never test a filter change against the only audit device on
+          a production cluster. "Low forensic value" is an engineering opinion: bring the
+          percentages to whoever owns the control and let them make the retention call. A
+          cheaper middle path than dropping is routing the LOW rows to cold storage instead of
+          the indexed tier. And if <b>everything else</b> is a large row, the classifier is
+          missing a pattern this estate runs; go look at it before quoting any number here.
+        </div>
+      </html>
+    </panel>
+  </row>
+
+  <!-- ============================ bytes reconciliation ============================ -->
+  <row>
+    <panel>
+      <title>Events vs bytes: a SIEM bills for bytes, and the two rankings disagree</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval bytes = len(_raw), mount_type = coalesce('request.mount_type',"(none)")
+| stats count AS events, sum(bytes) AS bytes, avg(bytes) AS avg_bytes BY mount_type type
+| eventstats sum(bytes) AS total_bytes, sum(events) AS total_events
+| eval pct_of_events = round(events * 100 / total_events, 2),
+       pct_of_bytes  = round(bytes  * 100 / total_bytes,  2),
+       avg_bytes     = round(avg_bytes, 0),
+       gb            = round(bytes / 1024 / 1024 / 1024, 3)
+| sort - bytes
+| head 20
+| table mount_type type events pct_of_events gb pct_of_bytes avg_bytes
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">none</option>
+        <format type="number" field="pct_of_events">
+          <option name="unit">%</option>
+        </format>
+        <format type="number" field="pct_of_bytes">
+          <option name="unit">%</option>
+        </format>
+      </table>
+    </panel>
+
+    <panel>
+      <title>What is inside "everything else" (run this if that row is large)</title>
+      <table>
+        <search>
+          <query>
+index=vault_audit sourcetype="vault:audit"
+| eval p = coalesce('request.path',"")
+| where NOT (match(p,"^(auth|sys|identity|cubbyhole)/") OR match(p,"/(data|metadata|subkeys|encrypt|decrypt)/") OR match(p,"/login$"))
+| stats count AS events BY request.mount_type request.operation request.mount_class
+| sort - events
+| head 20
+          </query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+</form>

@@ -1,5 +1,9 @@
 # Grafana
 
+> Screenshots pending. The previous ones showed panel titles and a banner that no
+> longer exist, so they were retired rather than left to document a version that is
+> gone. The Splunk walkthroughs carry current screenshots of the equivalent panels.
+
 The same answer without Splunk: identical numbers, identical dataset, no SIEM involved.
 
 ## Architecture
@@ -35,7 +39,7 @@ API), so there is no scrape config to edit and no existing pipeline to touch.
 | File | What it is |
 |---|---|
 | `dashboards/vault-secret-hygiene.json` | 7-panel dashboard. Prometheus for aggregates, Loki for the findings table |
-| `../scripts/vault-secret-aggregator.py` | The fold. stdlib only, no dependencies |
+| `scripts/vault-secret-aggregator.py` | The fold. stdlib only, no dependencies |
 
 ⚠️ **Change the datasource UIDs before importing.** They are inlined in the JSON and still
 point at the environment it was built in. Replace them with your own Prometheus and Loki
@@ -45,12 +49,9 @@ empty. Built against Grafana 10.2, `schemaVersion 38`.
 ## Run it
 
 ```bash
-cd splunk && python3 generate-sample.py --paths 500 --events 4000 --logins 1000 \
-    --out samples/audit.jsonl
-
-cd .. && python3 scripts/vault-secret-aggregator.py \
-    --audit       splunk/samples/audit.jsonl \
-    --inventory   splunk/samples/vault_secret_inventory.csv \
+python3 scripts/vault-secret-aggregator.py \
+    --audit       /path/to/vault-audit.log \
+    --inventory   /path/to/vault_secret_inventory.csv \
     --pushgateway http://<pushgateway-host>:9091 \
     --loki        http://<loki-host>:3100 \
     --state-file  .state/vault-secret-state.json \
