@@ -101,9 +101,3 @@ routine one.
 
 **`readers` empty but `writers` populated** is the same finding as NEVER READ, stated from
 the other side.
-
-## What to do with it
-
-For an auditor, export the table (**Export** in the top right of the dashboard). The
-`vault_auditor` role includes export capability precisely so an auditor can produce
-evidence without asking an engineer to run a search for them.
