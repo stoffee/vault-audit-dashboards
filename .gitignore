@@ -4,6 +4,10 @@
 samples/
 vault_secret_inventory.csv
 
+# Exception: hand-crafted, synthetic test fixtures the test suite needs to run.
+# No real paths or identities live here, only literal placeholder strings.
+!grafana/scripts/tests/fixtures/*.jsonl
+
 # Aggregator state
 .state/
 *.state.json

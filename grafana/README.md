@@ -1,31 +1,39 @@
 # Grafana
 
-> Screenshots pending. The previous ones showed panel titles and a banner that no
-> longer exist, so they were retired rather than left to document a version that is
-> gone. The Splunk walkthroughs carry current screenshots of the equivalent panels.
+The same answers without Splunk: identical numbers, identical dataset, no SIEM involved.
 
-The same answer without Splunk: identical numbers, identical dataset, no SIEM involved.
+![Vault Secret Hygiene overview](../docs/images/grafana-hygiene-overview.jpg)
+
+## Walkthroughs
+
+| | |
+|---|---|
+| [Find stale secrets](scenarios/01-find-stale-secrets.md) | The cleanup list, and the one input without which the headline number is silently wrong |
+| [Denied requests](scenarios/02-denied-requests.md) | A rising denial count against one path, worth an alert |
 
 ## Architecture
 
 ```
-Vault audit device ──► (Fluent Bit / file tail) ──► vault-secret-aggregator.py
-                                                        │
-                    folds to (namespace, path) -> last_read, last_write, reads, writes
-                                                        │
-                          ┌─────────────────────────────┴──────────────────────────┐
-                          ▼                                                        ▼
-              bucket COUNTS ──► Prometheus                    per-secret FINDINGS ──► Loki
-              (a handful of series)                           (log lines, stamped now)
-                          └─────────────────────────────┬──────────────────────────┘
-                                                        ▼
-                                                     Grafana
+Vault audit device ──► (file tail, or stdout captured as pod logs) ──► vault-secret-aggregator.py
+                                                                              │
+                        folds to (namespace, path) -> last_read, last_write, reads, writes,
+                                  plus denials -> (namespace, path, identity) -> count
+                                                                              │
+                    ┌─────────────────────┬───────────────────────────────────┴──┐
+                    ▼                     ▼                                      ▼
+        bucket COUNTS ──► Prometheus   denial COUNT (namespace only) ──► Prometheus
+        (a handful of series)                                                    │
+                    │            per-secret FINDINGS, denial DETAIL ──► Loki (log lines)
+                    └─────────────────────┬─────────────────────────────────────┘
+                                          ▼
+                                       Grafana
 ```
 
 **Why not just query Loki.** You cannot ask LogQL for "max timestamp per secret path" across
 hundreds of thousands of paths; path as a stream label is that many active series and it
 kills the index. So the fold happens in a process, and only aggregates cross the wire.
-Per-secret detail travels as log lines, never as labels.
+Per-secret and per-denial detail travel as log lines, never as labels. The same rule applies
+to the denial counter: it is exposed per namespace only, never per path or per identity.
 
 **Why findings are stamped "now".** A finding is an observation made today about history.
 It also keeps them inside Loki's `reject_old_samples` window, which would otherwise reject
@@ -38,8 +46,9 @@ API), so there is no scrape config to edit and no existing pipeline to touch.
 
 | File | What it is |
 |---|---|
-| `dashboards/vault-secret-hygiene.json` | 7-panel dashboard. Prometheus for aggregates, Loki for the findings table |
+| `dashboards/vault-secret-hygiene.json` | 8-panel dashboard. Prometheus for aggregates, Loki for the findings and denial tables |
 | `scripts/vault-secret-aggregator.py` | The fold. stdlib only, no dependencies |
+| `scripts/tests/` | Fixture-based tests, `python3 scripts/tests/test_aggregator.py` |
 
 ⚠️ **Change the datasource UIDs before importing.** They are inlined in the JSON and still
 point at the environment it was built in. Replace them with your own Prometheus and Loki
@@ -60,6 +69,26 @@ python3 scripts/vault-secret-aggregator.py \
 
 Drop `--pushgateway` and `--loki` to print the table locally; that needs nothing but Python 3.
 
+**`--audit` accepts `-` for stdin,** for an audit device that writes to stdout rather than a
+file on disk (a Kubernetes sidecar's pod logs, for instance):
+
+```bash
+kubectl logs -n vault sts/vault -c vault --since=24h | \
+    python3 scripts/vault-secret-aggregator.py --audit - --inventory inv.csv --print
+```
+
+**`--mounts` controls which engines fold, default `kv` only.** The `/data/` path
+requirement is a KV v2 API artifact and is enforced only for the `kv` mount type; add
+others and their paths fold without it:
+
+```bash
+--mounts kv,database,pki
+```
+
+Anything excluded is counted, not silently dropped: `--print` names every mount type it
+skipped and how many events each cost, and the same counts are pushed as
+`vault_secret_events_skipped{mount_type=...}`.
+
 **`--inventory` is not optional.** A secret nobody has ever read leaves no trace in the audit
 log, so nothing derived from logs can find it. It exists only in that file. Without it the
 headline number is silently wrong. The aggregator warns if you omit it.
@@ -67,14 +96,60 @@ headline number is silently wrong. The aggregator warns if you omit it.
 **`--state-file` is the eighteen-month memory.** In production it has to be checkpointed to
 disk. Lose it and the clock resets to zero.
 
+## Denials
+
+A denied request (any response carrying a non-empty `error`) is folded separately from
+reads and writes, and never marks a secret as accessed. See
+[Denied requests](scenarios/02-denied-requests.md) for how to read the panel and where the
+count versus the detail live.
+
+⚠️ **`request.remote_address` may not carry the true client IP** behind a load balancer or
+ingress that terminates TLS and proxies to Vault. If yours does, every denial can appear to
+share one source address. Confirm what your ingress preserves before building attribution
+logic on top of this field.
+
+## Root namespace and Enterprise
+
+Open-source Vault audit devices verified here emit **only** `request.namespace.id`, never
+`path` (namespaces are Enterprise-only in the first place, so an open-source device has
+nothing to put in `path`). The aggregator prefers `path`, falls back to `id`, then to no
+namespace at all:
+
+⚠️ **Whether Vault Enterprise emits `path` alongside `id` is unconfirmed here.** If it does
+not, every namespace collapses into one on a namespace-per-tenant estate, silently. The
+fallback handles it either way, but treat the "which field does my Enterprise cluster
+actually write" question as open until you have checked one real audit entry from it.
+
+Root is normalized specially: Vault's root namespace has the fixed id `"root"`, not an
+empty one, so without normalization an id-only device would produce keys like
+`"rootkv/data/app/db"` while a path-based device produces `"kv/data/app/db"` for the same
+secret. Both now resolve to the same key.
+
 ## ⚠️ The findings table accumulates across runs
 
-Findings are pushed to Loki as log lines stamped now, so **every fold appends a fresh copy**.
-Two folds inside the dashboard's time window means every secret appears twice.
+Findings and denial detail are pushed to Loki as log lines stamped now, so **every fold
+appends a fresh copy**. Two folds inside the dashboard's time window would show every
+secret twice without help.
 
-The quick fix is a Grafana `groupBy` transformation on secret path taking `lastNotNull` for
-the other columns, which makes the panel idempotent. The real fix is to stop using a log
-stream as a table: the aggregator's state belongs in SQLite or Postgres, queried directly.
+The dashboard's findings and denial panels both carry a `groupBy` transform (group by
+secret path, or by secret path plus identity for denials, `lastNotNull` for every other
+column), which makes the panel idempotent across repeated folds. That is why the table
+columns are named `namespace (lastNotNull)`, `reads (lastNotNull)`, and so on: that suffix
+is the transform's own output naming, not decoration. The real fix is still to stop using a
+log stream as a table: the aggregator's state belongs in SQLite or Postgres, queried
+directly. This transform is the workaround until that exists.
 
 The aggregate panels are unaffected. Prometheus gauges are replaced wholesale on each push,
 so the tiles and the histogram always show the latest fold only.
+
+## Tests
+
+```bash
+python3 grafana/scripts/tests/test_aggregator.py -v
+```
+
+Stdlib only, fixture-based, no live Grafana or Prometheus needed. Covers: the namespace
+fallback (path present, id-only, neither), root normalization, mount filtering with the
+default preserved, denials never counting as reads or entering the hygiene table, stdin
+producing identical output to a file, and the denial Prometheus counter carrying no path or
+identity label.
