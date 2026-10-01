@@ -1,0 +1,982 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Vault Secret Hygiene",
+      "type": "link",
+      "url": "/d/vault-secret-hygiene/vault-secret-hygiene",
+      "icon": "external link"
+    },
+    {
+      "title": "Vault Credential Lease Visibility",
+      "type": "link",
+      "url": "/d/vault-lease-visibility/vault-lease-visibility",
+      "icon": "external link"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 100,
+      "panels": [],
+      "title": "Last Transaction Details (for selection)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "topk(1, count_over_time({job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"}[5m])) | __stream_workload__",
+          "legendFormat": "{{workload}}",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "WHO",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "topk(1, count_over_time({job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"}[5m])) | __stream_operation__",
+          "legendFormat": "{{operation}}",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "WHAT",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "SUCCESS"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "green",
+                  "index": 1,
+                  "text": "SUCCESS"
+                }
+              },
+              "type": "special"
+            },
+            {
+              "options": {
+                "match": "empty",
+                "result": {
+                  "color": "green",
+                  "index": 2,
+                  "text": "SUCCESS"
+                }
+              },
+              "type": "special"
+            },
+            {
+              "options": {
+                "pattern": ".+",
+                "result": {
+                  "color": "red",
+                  "index": 3,
+                  "text": "FAILED"
+                }
+              },
+              "type": "regex"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "id": 9,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "{job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"} | json | path=~\"$path_filter\" | line_format \"{{.error}}\"",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "RESULT",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "purple",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "id": 15,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "count_over_time({job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"}[$__range])",
+          "legendFormat": "Total",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "TOTAL OPS",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "{job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"} | json | path=~\"$path_filter\" | line_format \"{{.path}}\"",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "SECRET PATH",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 16,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "{job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"} | json | path=~\"$path_filter\" | line_format \"{{.display_name}}\"",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "IDENTITY (display_name)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "id": 8,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "{job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"} | json | path=~\"$path_filter\" | line_format \"{{.remote_address}}\"",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "SOURCE IP",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 11
+      },
+      "id": 11,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "{job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"} | json | path=~\"$path_filter\" | line_format \"{{.policies}}\"",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "POLICIES",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "id": 101,
+      "panels": [],
+      "title": "Recent Transactions",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "left",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Line"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 800
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "id": 1,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false
+        },
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "Time"
+          }
+        ]
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "{job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"} | json | path=~\"$path_filter\" | line_format \"{{.operation | printf \\\"%-6s\\\"}} | {{.path}}\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent Transactions (filter by workload above, or by secret path)",
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "id": 102,
+      "panels": [],
+      "title": "Activity Over Time",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki-datasource"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Total",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "expr": "sum by (workload) (count_over_time({job=\"vault-audit\", event_type=\"response\", workload=~\"$selected_workload\"}[$__interval]))",
+          "legendFormat": "{{workload}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Activity Timeline",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "id": 103,
+      "panels": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                }
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 33
+          },
+          "id": 13,
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "values": [
+                "value",
+                "percent"
+              ]
+            },
+            "pieType": "pie",
+            "reduceOptions": {
+              "calcs": [
+                "sum"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "tooltip": {
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.2.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki-datasource"
+              },
+              "expr": "sum by (operation) (count_over_time({job=\"vault-audit\", event_type=\"response\"}[$__range]))",
+              "legendFormat": "{{operation}}",
+              "queryType": "range",
+              "refId": "A"
+            }
+          ],
+          "title": "Operations Distribution",
+          "type": "piechart"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki-datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                }
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 33
+          },
+          "id": 14,
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "values": [
+                "value",
+                "percent"
+              ]
+            },
+            "pieType": "pie",
+            "reduceOptions": {
+              "calcs": [
+                "sum"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "tooltip": {
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.2.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki-datasource"
+              },
+              "expr": "sum by (workload) (count_over_time({job=\"vault-audit\", event_type=\"response\"}[$__range]))",
+              "legendFormat": "{{workload}}",
+              "queryType": "range",
+              "refId": "A"
+            }
+          ],
+          "title": "Access by Workload",
+          "type": "piechart"
+        }
+      ],
+      "title": "Breakdown Charts (click to expand)",
+      "type": "row"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "vault",
+    "audit",
+    "loki",
+    "transaction-trace"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "loki-datasource"
+        },
+        "definition": "label_values({job=\"vault-audit\"}, workload)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Select Job",
+        "multi": false,
+        "name": "selected_workload",
+        "options": [],
+        "query": "label_values({job=\"vault-audit\"}, workload)",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": ".*",
+          "value": ".*"
+        },
+        "description": "Regex against the secret path. Leave as .* and set Select Workload to trace a workload; set this and leave Select Workload as All to trace a secret.",
+        "hide": 0,
+        "label": "Secret path filter",
+        "name": "path_filter",
+        "options": [],
+        "query": ".*",
+        "skipUrlSync": false,
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Vault Transaction Trace",
+  "uid": "vault-transaction-trace",
+  "version": 1,
+  "weekStart": ""
+}

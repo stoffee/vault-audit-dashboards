@@ -11,6 +11,7 @@ The same answers without Splunk: identical numbers, identical dataset, no SIEM i
 | [Find stale secrets](scenarios/01-find-stale-secrets.md) | The cleanup list, and the one input without which the headline number is silently wrong |
 | [Denied requests](scenarios/02-denied-requests.md) | A rising denial count against one path, worth an alert |
 | [Credential lease visibility](scenarios/03-credential-lease-visibility.md) | Azure/AWS/Database, live-polled not audit-folded. Only Database is verified |
+| [Trace a transaction](scenarios/04-trace-a-transaction.md) | A secret out to its consumers, or a workload in to what it touched. A different pipeline from the two above — see below |
 
 ## Architecture
 
@@ -43,12 +44,52 @@ an 18-month-old timestamp outright.
 **Nothing in your stack changes.** The aggregator pushes (Prometheus Pushgateway + Loki push
 API), so there is no scrape config to edit and no existing pipeline to touch.
 
+## Architecture: the raw-audit-to-Loki pipeline (Transaction Trace only)
+
+`vault-transaction-trace.json` does not go through the aggregator. It reads **raw audit
+event JSON, one line per event**, pushed into Loki by a log shipper — Promtail, Vector,
+or (as originally built) a small HTTP sink in front of HCP Vault's audit-log-streaming
+feature. The pivot happens in LogQL at query time, not in a Python fold:
+
+```
+Vault audit device ──► shipper (Promtail / Vector / an HTTP sink) ──► Loki
+                                                                          │
+                        one log line per audit event, JSON body intact,
+                        two labels only: event_type ("request"/"response"), workload
+                                                                          │
+                                                                       Grafana
+                                    (LogQL parses path/operation/policies/etc.
+                                     out of the JSON body at query time)
+```
+
+**This does not violate the "path can never be a label" rule above.** `path` is never a
+Loki label here either — it's parsed out of the JSON body per query with `| json`. The only
+labels are `event_type` and `workload`, both low-cardinality by construction. Whether that
+holds depends entirely on what your shipper puts in `workload`: it has to be a small,
+bounded set of identities (a k8s service account name, a CI pipeline ID, a Nomad job name —
+whatever your auth method's `display_name` reduces to), not something with the cardinality
+of `path` itself.
+
+**Your shipper has to build `workload` from `auth.display_name`.** Nothing here does that
+extraction for you — it's config on whichever shipper you use (a Promtail pipeline stage, a
+Vector VRL transform, or bespoke code in an HTTP sink like the one this was originally
+built against). See [Trace a transaction](scenarios/04-trace-a-transaction.md) for the full
+field mapping and what breaks if the shipper doesn't populate it.
+
+**Not proven against a generic pipeline yet.** The dashboard was deployed and used for real
+against one specific setup: HCP Vault's built-in audit-log-streaming endpoint, an HTTP sink,
+and Nomad workload identity (`nomad_job`) as the `workload` label. It's been generalized
+here — `nomad_job` renamed to `workload`, a secret-path filter added — but that generalized
+form hasn't been run against a live Grafana + Loki yet. Treat it the way the lease dashboard
+treats AWS/Azure: usable as a starting point, not yet verified end to end.
+
 ## Files
 
 | File | What it is |
 |---|---|
 | `dashboards/vault-secret-hygiene.json` | 8-panel dashboard. Prometheus for aggregates, Loki for the findings and denial tables |
 | `dashboards/vault-lease-visibility.json` | 7-panel dashboard for leased credentials (Azure/AWS/Database). Live-polled, not audit-folded, see below |
+| `dashboards/vault-transaction-trace.json` | 13-panel dashboard, workload ⇄ secret pivot. Reads raw audit JSON from Loki directly — no aggregator, see above |
 | `scripts/vault-secret-aggregator.py` | The KV hygiene fold. Grafana-only: Splunk does this fold itself in SPL |
 | `scripts/tests/test_aggregator.py` | Fixture-based tests for the aggregator above |
 
