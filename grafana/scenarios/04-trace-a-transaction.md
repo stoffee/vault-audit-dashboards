@@ -8,14 +8,14 @@ Lease Visibility both go through `vault-secret-aggregator.py`, which folds the a
 into aggregates before anything crosses the wire. Transaction Trace instead reads **raw
 audit JSON pushed straight into Loki**, one line per event, and does the pivot at query
 time. See **Architecture: the raw-audit-to-Loki pipeline** in `grafana/README.md` before
-deploying this one — it needs a shipper, not the aggregator.
+deploying this one - it needs a shipper, not the aggregator.
 
 ## The pivot: workload identity
 
 The trace keys on **who the client is**, not a hostname or IP, because in a containerised
 estate those are meaningless by the time you investigate. The dashboard's `workload` label
 is whatever your shipper extracts from the audit event's `display_name` (or equivalent) at
-ingest time — see the README for what that extraction has to do.
+ingest time - see the README for what that extraction has to do.
 
 ⚠️ **If the "Select Workload" dropdown collapses to one value or `unknown`, your auth mount
 is not writing identity metadata**, or the shipper isn't parsing it out. That's a mount
@@ -54,7 +54,7 @@ single boolean-ish read of the `error` string, not the OR-of-two-signals logic t
 transaction trace uses (`auth.policy_results.allowed` OR non-empty `error`, see
 [Splunk's version of this scenario](../../splunk/scenarios/02-trace-a-transaction.md#reading-the-result)
 for why one signal alone under-counts). If you need that finer denial/auth-failure split on
-the Grafana side, it isn't built here yet — the Secret Hygiene dashboard's separate
+the Grafana side, it isn't built here yet - the Secret Hygiene dashboard's separate
 **Denied requests** panel ([scenario](02-denied-requests.md)) is namespace-scoped, not
 per-workload, and doesn't fill this gap.
 
@@ -76,11 +76,11 @@ trusting a number from it.
 
 | Panel expects | Comes from (in the audit event JSON) |
 |---|---|
-| `workload` (Loki label) | Whatever your shipper derives from `auth.display_name` — see README |
+| `workload` (Loki label) | Whatever your shipper derives from `auth.display_name` - see README |
 | `operation` | `request.operation` |
 | `path` | `request.path` |
 | `display_name` | `auth.display_name` |
 | `remote_address` | `request.remote_address` |
 | `policies` | `auth.policies` (or `auth.token_policies`) |
 | `error` | top-level `error` on the response event |
-| `event_type` | `request` vs `response` — the dashboard reads `response` only |
+| `event_type` | `request` vs `response` - the dashboard reads `response` only |
