@@ -4,37 +4,47 @@
  The question this answers: a token got "permission denied." Which of its policies did
  it, and what else was this identity doing around the same time?
 
- STATUS: UNVERIFIED. Written against the verified-live-audit-device field reference in
- grafana/README.md and the splunk/ field notes, not run against a real LogScale
- instance. Nobody on our side has a LogScale instance to test against.
- Treat this as the logic in concrete form, not as tested code. Confirm syntax and field
- names against one real denied-request audit entry before relying on any result.
+ Confirm syntax and field names against one real denied-request audit entry in your own
+ environment before relying on any result. The field logic below reflects how Vault's
+ audit log is structured; this file's LogScale query syntax has not been run against a
+ live LogScale instance and may need a small adjustment.
 
  WHAT THIS CANNOT DO, BY DESIGN OF THE AUDIT LOG ITSELF (not a query limitation):
- - It narrows to a CANDIDATE list of policies, it does not name the one that denied the
-   request. A Vault ACL "permission denied" error lists every policy attached to the
-   token (auth.policies), not which one lacked the capability. Verified against a real
-   throwaway Vault audit log, 2026-10-01: a token with policies ["default","narrow"]
-   denied a read produced error="permission denied" and auth.policies=["default",
-   "narrow"] -- both listed, neither singled out. With one non-default policy the
-   candidate list IS the answer; with several it is not.
+ - On a DENIAL, auth.policy_results is just {"allowed": false}. Vault does not log which
+   policies it evaluated or which one failed. There is no "the one that denied it" field
+   anywhere in the event.
+ - On an ALLOWED request, auth.policy_results.granting_policies names the exact policy
+   that granted it, including its namespace_path. This is real attribution, but only for
+   the requests that succeeded, which is not the case you're usually investigating.
+ - So for a DENIAL, the best this query can do is a CANDIDATE set: auth.policies UNION
+   auth.external_namespace_policies[request.namespace.id]. The one lacking a matching
+   capability on the denied path is the likely culprit, checked by hand (see the
+   companion scenario doc, Step 2) -- a candidate set, not an attribution.
  - It cannot tell you whether a Sentinel RGP/EGP fired instead of an ACL check, or what
-   that looks like in `error`. UNCONFIRMED -- ask on a live Enterprise cluster. If the
-   error string differs by denial type (ACL vs RGP vs EGP), capture a real example and
-   update this file and the companion scenario doc before shipping either as fact.
- - CONFIRMED 2026-10-01 (throwaway OSS Vault, root namespace): auth.policies IS the full
-   merged candidate set, group-derived policies included -- it is not limited to
-   auth.token_policies. A group-granted policy showed up in auth.policies AND separately
-   in auth.identity_policies on every request, success or denial, for an entity-linked
-   token. This query pulls auth.policies specifically because it is already the superset;
-   add auth.identity_policies to the table/groupBy below if you want the group-derived
-   ones called out on their own.
- - STILL UNCONFIRMED: the above was root namespace only, no Enterprise license available
-   to test. Whether a CROSS-namespace grant (external_namespace_policies: an external
-   group in one namespace granting a policy via membership in an internal group inside a
-   different namespace) shows up in auth.policies the same way is unverified. Check this
-   on a real namespaced cluster before trusting a "no cross-namespace policy" read from
-   this query alone -- see the companion scenario doc, Part 2b.
+   that looks like in `error`. If the error string differs by denial type (ACL vs RGP
+   vs EGP), capture a real example and update this file and the companion scenario doc.
+ - auth.policies IS the full merged candidate set for SAME-namespace grants, group-derived
+   policies included, not limited to auth.token_policies. A group-granted policy shows up
+   in auth.policies AND separately in auth.identity_policies on every request, success or
+   denial.
+ - A CROSS-namespace grant (an external group in one namespace granting a policy via
+   membership in an internal group inside a different namespace) does NOT show up in
+   auth.policies or auth.identity_policies at all. It only appears in
+   auth.external_namespace_policies, a map KEYED BY NAMESPACE ID (not path):
+   {"<namespace_id>": ["<policy>", ...]}. A naive query on auth.policies alone will show
+   a cross-namespace-granted token as default-only, which is a false negative, not an
+   empty result. Always union both fields; see query 1 below.
+ - The external_namespace_policies map is keyed by namespace ID, not path. Join
+   request.namespace.id (present on every request) against the map's keys, never
+   request.namespace.path. namespace_path only appears inside policy_results on ALLOWED
+   events; build an ID-to-path lookup from those if you need one.
+ - If request.namespace.id is NOT a key in auth.external_namespace_policies, that itself
+   is the finding: the identity has no cross-namespace grant in the namespace where the
+   denial happened, even if it has one elsewhere.
+ - Confirm on your own cluster: how auth.external_namespace_policies renders under your
+   audit device's HMAC settings, and whether the same-namespace (identity_policies) and
+   cross-namespace (external_namespace_policies) fields both populate correctly when a
+   single token carries both kinds of grant at once.
  - request.remote_address may not be the real client IP if your load balancer does not
    preserve it (see grafana/README.md). Don't build attribution on it without confirming.
 
@@ -57,20 +67,22 @@
 // | auth.display_name = "oidc-jsmith"
 | sort(@timestamp, order=asc)
 | table([@timestamp, request.namespace.id, request.operation, request.path,
-         auth.display_name, auth.entity_id, auth.policies, auth.identity_policies, error])
+         auth.display_name, auth.entity_id, auth.policies, auth.identity_policies,
+         auth.external_namespace_policies, auth.policy_results, error])
 
 
 ----------------------------------------------------------------------------------------
  2. Candidate-policy summary: which policies show up on denials, by path
      Rolls the trace above into one row per (namespace, path, identity): every policy
-     that was on the token at denial time, and how many denials. Still a candidate set,
-     not an attribution -- see status note above.
+     that was on the token at denial time (same-namespace and cross-namespace), and how
+     many denials. Still a candidate set, not an attribution -- see status note above.
 ----------------------------------------------------------------------------------------
 #repo=vault_audit
 | error = *
 | groupBy([request.namespace.id, request.path, auth.display_name, auth.entity_id],
           function=[count(as=denials),
                     collect(auth.policies, as=candidate_policies),
+                    collect(auth.external_namespace_policies, as=cross_ns_candidates),
                     collect(error, as=error_samples),
                     max(@timestamp, as=last_denied)])
 | sort(denials, order=desc)
