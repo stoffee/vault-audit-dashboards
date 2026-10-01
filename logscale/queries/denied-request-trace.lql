@@ -1,0 +1,87 @@
+========================================================================================
+ Denied request trace: chronological denial log with candidate policies, in LogScale
+========================================================================================
+ The question this answers: a token got "permission denied." Which of its policies did
+ it, and what else was this identity doing around the same time?
+
+ STATUS: UNVERIFIED. Written against the verified-live-audit-device field reference in
+ grafana/README.md and the splunk/ field notes, not run against a real LogScale
+ instance. Nobody on our side has a LogScale instance to test against.
+ Treat this as the logic in concrete form, not as tested code. Confirm syntax and field
+ names against one real denied-request audit entry before relying on any result.
+
+ WHAT THIS CANNOT DO, BY DESIGN OF THE AUDIT LOG ITSELF (not a query limitation):
+ - It narrows to a CANDIDATE list of policies, it does not name the one that denied the
+   request. A Vault ACL "permission denied" error lists every policy attached to the
+   token (auth.policies), not which one lacked the capability. Verified against a real
+   throwaway Vault audit log, 2026-10-01: a token with policies ["default","narrow"]
+   denied a read produced error="permission denied" and auth.policies=["default",
+   "narrow"] -- both listed, neither singled out. With one non-default policy the
+   candidate list IS the answer; with several it is not.
+ - It cannot tell you whether a Sentinel RGP/EGP fired instead of an ACL check, or what
+   that looks like in `error`. UNCONFIRMED -- ask on a live Enterprise cluster. If the
+   error string differs by denial type (ACL vs RGP vs EGP), capture a real example and
+   update this file and the companion scenario doc before shipping either as fact.
+ - CONFIRMED 2026-10-01 (throwaway OSS Vault, root namespace): auth.policies IS the full
+   merged candidate set, group-derived policies included -- it is not limited to
+   auth.token_policies. A group-granted policy showed up in auth.policies AND separately
+   in auth.identity_policies on every request, success or denial, for an entity-linked
+   token. This query pulls auth.policies specifically because it is already the superset;
+   add auth.identity_policies to the table/groupBy below if you want the group-derived
+   ones called out on their own.
+ - STILL UNCONFIRMED: the above was root namespace only, no Enterprise license available
+   to test. Whether a CROSS-namespace grant (external_namespace_policies: an external
+   group in one namespace granting a policy via membership in an internal group inside a
+   different namespace) shows up in auth.policies the same way is unverified. Check this
+   on a real namespaced cluster before trusting a "no cross-namespace policy" read from
+   this query alone -- see the companion scenario doc, Part 2b.
+ - request.remote_address may not be the real client IP if your load balancer does not
+   preserve it (see grafana/README.md). Don't build attribution on it without confirming.
+
+ Nested JSON fields come through the audit event body; adjust the parse stage below to
+ however your LogScale repo is configured (#type/structuredData vs raw JSON parse).
+========================================================================================
+
+
+----------------------------------------------------------------------------------------
+ 1. Chronological denial trace for one path or one identity
+     The "search through X Y Z path and get the trace, chronological" view: walk every
+     denial against one path, or everything one identity hit, in time order. Swap the
+     filter line for either a path or an identity; leave the other broad to see
+     everything nearby.
+----------------------------------------------------------------------------------------
+#repo=vault_audit
+| error = *
+// pick ONE of the next two lines, comment out the other
+| request.path = "secret/data/prod/db-creds"
+// | auth.display_name = "oidc-jsmith"
+| sort(@timestamp, order=asc)
+| table([@timestamp, request.namespace.id, request.operation, request.path,
+         auth.display_name, auth.entity_id, auth.policies, auth.identity_policies, error])
+
+
+----------------------------------------------------------------------------------------
+ 2. Candidate-policy summary: which policies show up on denials, by path
+     Rolls the trace above into one row per (namespace, path, identity): every policy
+     that was on the token at denial time, and how many denials. Still a candidate set,
+     not an attribution -- see status note above.
+----------------------------------------------------------------------------------------
+#repo=vault_audit
+| error = *
+| groupBy([request.namespace.id, request.path, auth.display_name, auth.entity_id],
+          function=[count(as=denials),
+                    collect(auth.policies, as=candidate_policies),
+                    collect(error, as=error_samples),
+                    max(@timestamp, as=last_denied)])
+| sort(denials, order=desc)
+
+
+----------------------------------------------------------------------------------------
+ 3. Sanity check: does this repo have denial events at all, and do they carry auth.policies?
+     RUN THIS FIRST against a real environment. If candidate_policy_coverage is 0, the
+     audit device or the LogScale parser is dropping the auth block and nothing below
+     this line will ever return a usable candidate list.
+----------------------------------------------------------------------------------------
+#repo=vault_audit
+| error = *
+| test(auth.policies != null) | count(as=with_policies)

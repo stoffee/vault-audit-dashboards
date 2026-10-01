@@ -17,6 +17,7 @@ in the audit log.
 |---|---|
 | **[Splunk](splunk/README.md)** | Three dashboards plus a drop-in app. Self-contained: the fold happens in SPL, inside Splunk |
 | **[Grafana](grafana/README.md)** | Dashboard JSON plus an aggregator. Grafana cannot do this fold itself, so the aggregator is required, not optional |
+| **[LogScale](logscale/README.md)** | Queries only, no dashboard yet. For estates where the audit stream already lands in CrowdStrike LogScale / NG-SIEM. ⚠️ Unverified - no LogScale instance to test against |
 
 The numbers agree. Use whichever you already own.
 
@@ -31,6 +32,7 @@ Step by step, with what each result means and where it can mislead you.
 | [Find stale secrets](splunk/scenarios/03-find-stale-secrets.md) | The cleanup list, and the one input without which the headline number is silently wrong |
 | [Where is my audit volume coming from?](splunk/scenarios/04-where-is-my-audit-volume.md) | Turning "the logs are too big" into an evidence-based filtering argument |
 | [Credential lease visibility](splunk/scenarios/05-credential-lease-visibility.md) | Azure/AWS/Database: live-polled, not audit-folded, because the audit log cannot record expiry |
+| [Which policy denied this?](logscale/scenarios/01-which-policy-denied-this.md) | A denied token has several policies - narrow the candidates with the audit trace, then pin it down with a live lookup. The audit log alone cannot fully answer this, for any tool |
 
 ## What you need
 
@@ -51,6 +53,9 @@ grafana/
   dashboards/     Dashboard JSON
   scripts/        The KV hygiene aggregator, plus the credential lease poller
                   (Splunk keeps its own copy at splunk-app/.../bin/, source of truth here)
+logscale/
+  queries/        LQL, unverified against a real LogScale instance
+  scenarios/      The walkthrough above
 docs/             How it works, and how to test it
 ```
 
