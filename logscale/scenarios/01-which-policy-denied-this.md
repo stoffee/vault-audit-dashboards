@@ -92,12 +92,12 @@ only checks `auth.policies` reads this token as default-only in every namespace,
 is a false negative, not an empty result, and the wrong conclusion to hand someone
 mid-investigation.
 
-Two things worth confirming on your own cluster before relying on this: how
-`external_namespace_policies` renders under your audit device's HMAC settings, and
-whether the same-namespace (`identity_policies`) and cross-namespace
+Three things worth confirming on your own cluster before relying on this: how
+`external_namespace_policies` renders under your audit device's HMAC settings, whether
+the same-namespace (`identity_policies`) and cross-namespace
 (`external_namespace_policies`) fields both populate correctly when a single token
-carries both kinds of grant at once. Also still open: whether a Sentinel RGP/EGP denial
-produces a different `error` shape than ACL.
+carries both kinds of grant at once, and whether a Sentinel RGP/EGP denial produces a
+different `error` shape than ACL.
 
 ## Step 1: Run the trace
 
@@ -171,8 +171,7 @@ VAULT_LOG_LEVEL=trace vault <command> -output-policy   # generates the policy th
 ## Step 5: Sentinel RGP/EGP
 
 None of the above distinguishes an ACL denial from a Sentinel one. If a real denial of
-that kind turns up, capture the raw `error` string: that's the one piece this guide
-doesn't currently cover.
+that kind turns up, capture the raw `error` string.
 
 ## What this cannot tell you
 
